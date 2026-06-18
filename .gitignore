@@ -1,3 +1,5 @@
 /.idea/
 selected_stocks.txt
 stocks_2y.db
+/stocks_2y.db-shm
+/stocks_2y.db-wal
