@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 下载全季度净利润同比增长率 + 发布日期 + 股票名称
-最终版：全季度数据、并发下载、发布日期对齐、无冲突批量写入
+最终优化版：增量更新、6线程安全并发、存在跳过、无冲突批量写入
 """
 import baostock as bs
 import sqlite3
@@ -11,13 +11,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DB_PATH = 'stocks_2y.db'
-THREAD_NUM = 4
-REQUEST_DELAY = 0.15
+THREAD_NUM = 6
+REQUEST_DELAY = 0.1
 MAX_RETRY = 2
 
 CURRENT_YEAR = datetime.now().year
 YEARS = [CURRENT_YEAR - 1, CURRENT_YEAR]
-QUARTERS = [1, 2, 3, 4]  # 全季度下载，支撑连续期数判断
+QUARTERS = [1, 2, 3, 4]
 
 def init_worker():
     bs.login()
@@ -41,14 +41,34 @@ def init_db(conn):
         )''')
     conn.commit()
 
+def get_existing_stat_dates(conn, code):
+    """获取某只股票已有的报告期，避免重复下载"""
+    cursor = conn.execute("SELECT stat_date FROM financial WHERE code=?", (code,))
+    return {row[0] for row in cursor.fetchall()}
+
+def get_latest_stat_date(conn):
+    """获取数据库中最新的报告期，用于增量判断"""
+    try:
+        cursor = conn.execute("SELECT MAX(stat_date) FROM financial")
+        res = cursor.fetchone()[0]
+        return res if res else '2000-01-01'
+    except:
+        return '2000-01-01'
+
 def download_single_financial(args):
-    code, name = args
+    code, name, existing_dates = args
     for retry in range(MAX_RETRY + 1):
         try:
             profit_data = {}
             pub_dates = {}
             for year in YEARS:
                 for quarter in QUARTERS:
+                    # 构造报告期日期，粗略判断是否已存在（精确匹配在入库前做）
+                    stat_month = {1:'03-31', 2:'06-30', 3:'09-30', 4:'12-31'}[quarter]
+                    stat_date_str = f"{year}-{stat_month}"
+                    if stat_date_str in existing_dates:
+                        continue  # 本地已有，直接跳过
+
                     rs = bs.query_growth_data(code, year=year, quarter=quarter)
                     if rs.error_code != '0':
                         continue
@@ -106,15 +126,27 @@ def batch_write_safe(conn, df_list):
 
 # ==================== 主流程 ====================
 if __name__ == '__main__':
-    print("登录 baostock ...")
-    bs.login()
-
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
 
     codes = get_mainboard_codes()
-    print(f"下载财务数据，共 {len(codes)} 只股票，{THREAD_NUM} 线程并发，全季度数据")
-    bs.logout()
+    latest_date = get_latest_stat_date(conn)
+
+    # 判断是否需要全量更新
+    is_full_update = latest_date == '2000-01-01'
+    mode_str = "全量下载" if is_full_update else "增量更新"
+    print(f"财务数据{mode_str}，共 {len(codes)} 只股票，{THREAD_NUM} 线程并发，全季度数据")
+
+    # 预加载所有已存在的报告期，传入线程减少数据库查询
+    all_existing = {}
+    if not is_full_update:
+        cursor = conn.execute("SELECT code, stat_date FROM financial")
+        for code, sd in cursor.fetchall():
+            if code not in all_existing:
+                all_existing[code] = set()
+            all_existing[code].add(sd)
+
+    conn.close()
 
     success = 0
     failed = []
@@ -122,7 +154,8 @@ if __name__ == '__main__':
     BATCH_SIZE = 50
 
     with ThreadPoolExecutor(max_workers=THREAD_NUM, initializer=init_worker) as executor:
-        futures = {executor.submit(download_single_financial, task): task for task in codes}
+        tasks = [(code, name, all_existing.get(code, set())) for code, name in codes]
+        futures = {executor.submit(download_single_financial, task): task for task in tasks}
         for i, future in enumerate(as_completed(futures)):
             result, fail_code = future.result()
             if result is not None and not result.empty:
@@ -130,7 +163,9 @@ if __name__ == '__main__':
                 success += 1
 
                 if len(batch_buffer) >= BATCH_SIZE:
+                    conn = sqlite3.connect(DB_PATH)
                     batch_write_safe(conn, batch_buffer)
+                    conn.close()
                     batch_buffer = []
                     print(f"  已完成 {success}/{len(codes)} 只")
             else:
@@ -140,10 +175,10 @@ if __name__ == '__main__':
                 print(f"  已处理 {i+1}/{len(codes)}")
 
     if batch_buffer:
+        conn = sqlite3.connect(DB_PATH)
         batch_write_safe(conn, batch_buffer)
+        conn.close()
 
-    conn.commit()
-    conn.close()
     print(f"\n财务数据下载完成，成功 {success}/{len(codes)} 只")
     if failed:
         print(f"失败 {len(failed)} 只，部分失败代码：{failed[:10]}")
