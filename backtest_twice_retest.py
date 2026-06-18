@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-选股+回测+导出 最终版（修复 numpy.datetime64 报错 + 调仓对齐）
+选股+回测+导出 最终版（真实交易成本模拟）
 条件：年线上升 + 连续N期净利润正增长 + 月/周线两次回踩均线
 """
 import sqlite3
@@ -12,26 +12,26 @@ DB_PATH = 'stocks_2y.db'
 BENCH_CODE = 'sh.000300'
 
 # ==================== 可调参数 ====================
-BACKTEST_START = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+BACKTEST_START = (datetime.now() - timedelta(days=365*3)).strftime('%Y-%m-%d')  # 回测3年
 BACKTEST_END = datetime.now().strftime('%Y-%m-%d')
-INIT_CASH = 100000
-MAX_STOCKS = 200
-TOLERANCE = 0.2                # 回踩容忍度20%
-MIN_LIQUIDITY = 3000           # 日均成交额最低3000万元
-CONSECUTIVE_FIN_PERIODS = 1    # 连续盈利期数
+INIT_CASH = 1000000
+MAX_STOCKS = 200               # 控制持仓数量
+TOLERANCE = 0.15               # 回踩容忍度15%
+MIN_LIQUIDITY = 3000           # 日均成交额最低5000万
+CONSECUTIVE_FIN_PERIODS = 2    # 连续2期盈利
 MONTHLY_MA = 12
 WEEKLY_MA = 20
 REBALANCE_FREQ = 'W'           # W=周，M=月
-COMMISSION = 0.0003
-SLIPPAGE = 0.001
-STAMP_DUTY = 0.001
+COMMISSION = 0.0003            # 佣金
+SLIPPAGE = 0.001               # 滑点
+STAMP_DUTY = 0.001             # 印花税（卖出）
 
 # ==================== 数据加载 ====================
 def load_all_data(conn):
     query = """
             SELECT code, date, open, high, low, close, volume
             FROM daily
-            WHERE date >= date('now', '-3 years')
+            WHERE date >= date('now', '-5 years')
             ORDER BY code, date \
             """
     df = pd.read_sql(query, conn, parse_dates=['date'])
@@ -64,9 +64,8 @@ def detect_retest_signal(price_df, ma_period, signal_ma=5, tolerance=TOLERANCE, 
 def vectorized_select_stocks(df_daily, df_fin, name_map, target_date=None):
     if target_date is None:
         target_date = df_daily.index.get_level_values('date').max()
-    # 确保 target_date 是 Timestamp 类型
     target_date = pd.Timestamp(target_date)
-    print(f"  选股日期: {target_date.date()}")
+    # print(f"  选股日期: {target_date.date()}")  # 回测时可关闭详细日志
 
     df = df_daily.loc[df_daily.index.get_level_values('date') <= target_date].copy()
     stock_codes = [c for c in df.index.get_level_values('code').unique() if c != BENCH_CODE]
@@ -82,7 +81,8 @@ def vectorized_select_stocks(df_daily, df_fin, name_map, target_date=None):
     base = latest[(latest['ma250_slope'] > 0) & (latest['close'] > latest['ma250']) &
                   (latest['amount_ma20'] >= MIN_LIQUIDITY)]
     base_codes = base.index.get_level_values('code').tolist()
-    print(f"  基础筛选: {len(base_codes)} 只")
+    if not base_codes:
+        return []
 
     df_f = df_stocks[df_stocks.index.get_level_values('code').isin(base_codes)]
     if df_f.empty: return []
@@ -96,7 +96,6 @@ def vectorized_select_stocks(df_daily, df_fin, name_map, target_date=None):
     w_df = pd.DataFrame({'close': w_close.stack(), 'low': w_low.stack()})
     w_signal = detect_retest_signal(w_df, ma_period=WEEKLY_MA, window=30)
     w_codes = w_signal.groupby(level='code').tail(1).pipe(lambda x: x[x].index.get_level_values('code').tolist())
-    print(f"  周线信号: {len(w_codes)} 只")
 
     # 月线
     m_close = daily_close.resample('ME').last()
@@ -104,7 +103,6 @@ def vectorized_select_stocks(df_daily, df_fin, name_map, target_date=None):
     m_df = pd.DataFrame({'close': m_close.stack(), 'low': m_low.stack()})
     m_signal = detect_retest_signal(m_df, ma_period=MONTHLY_MA, window=24)
     m_codes = m_signal.groupby(level='code').tail(1).pipe(lambda x: x[x].index.get_level_values('code').tolist())
-    print(f"  月线信号: {len(m_codes)} 只")
 
     tech = {}
     for c in set(w_codes + m_codes):
@@ -117,20 +115,106 @@ def vectorized_select_stocks(df_daily, df_fin, name_map, target_date=None):
 
     fin_before = df_fin[df_fin['effective_date'] <= target_date]
     if fin_before.empty:
-        print("  无有效财务数据")
         return []
     fin_latest = fin_before.sort_values('effective_date').groupby('code').tail(CONSECUTIVE_FIN_PERIODS)
     fin_pass = fin_latest.groupby('code').filter(lambda x: all(x['net_profit_yoy'] > 0) and len(x) == CONSECUTIVE_FIN_PERIODS)
     fin_codes = fin_pass['code'].unique().tolist()
-    print(f"  财务符合: {len(fin_codes)} 只")
 
     candidates = [(c, *tech[c]) for c in tech if c in fin_codes]
     candidates.sort(key=lambda x: x[1])
     final = candidates[:MAX_STOCKS]
-    print(f"  最终选股: {len(final)} 只")
     return [(c, name_map.get(c, c), t) for c, _, t in final]
 
-# ==================== 自建回测引擎 ====================
+# ==================== 回测引擎（含真实成本） ====================
+def run_backtest(df_daily, df_fin, name_map, start_date, end_date):
+    close_all = df_daily['close'].unstack(level='code')
+    close_all = close_all.loc[start_date:end_date].dropna(axis=1, how='all')
+    bench_close = close_all[BENCH_CODE] if BENCH_CODE in close_all.columns else None
+    stock_close = close_all[[c for c in close_all.columns if c != BENCH_CODE]]
+
+    freq = 'W' if REBALANCE_FREQ == 'W' else 'ME'
+    periods = stock_close.index.to_period(freq)
+    rebalance_dates = stock_close.groupby(periods).apply(lambda x: x.index[-1]).values
+
+    cash = INIT_CASH
+    holdings = {}  # code -> shares (int, 按100股取整)
+    net_values = []
+    last_date = None
+
+    for d_raw in rebalance_dates:
+        d = pd.Timestamp(d_raw)
+        sel = vectorized_select_stocks(df_daily, df_fin, name_map, target_date=d)
+        target_codes = [s[0] for s in sel if s[0] in stock_close.columns]
+
+        # 计算从上一个调仓日到d前一天的持仓净值
+        if last_date is not None:
+            mask = (stock_close.index > last_date) & (stock_close.index < d)
+            for day in stock_close.index[mask]:
+                value = cash
+                for code, shares in holdings.items():
+                    if code in stock_close.columns:
+                        value += shares * stock_close.loc[day, code]
+                net_values.append((day, value))
+
+        # 调仓操作：d日收盘价卖出旧持仓
+        for code in list(holdings.keys()):
+            if code in stock_close.columns:
+                sell_price = stock_close.loc[d, code]
+                sell_amount = holdings[code] * sell_price
+                cash += sell_amount * (1 - COMMISSION - STAMP_DUTY)
+        holdings.clear()
+
+        # 买入新持仓（等权分配，按手数取整）
+        if len(target_codes) > 0:
+            prices = stock_close.loc[d, target_codes]
+            # 计算每只股票投入资金（考虑买入成本）
+            avg_cash = cash / len(prices)
+            for code in target_codes:
+                buy_price = prices[code]
+                # 买入成本 = 佣金+滑点，成本率 (1+COMMISSION+SLIPPAGE)
+                max_shares = int(avg_cash / (buy_price * (1 + COMMISSION + SLIPPAGE)))
+                shares = (max_shares // 100) * 100  # 按手取整
+                if shares > 0:
+                    cost = shares * buy_price * (1 + COMMISSION + SLIPPAGE)
+                    cash -= cost
+                    holdings[code] = shares
+
+        # d日调仓后持仓价值
+        value = cash
+        for code, shares in holdings.items():
+            if code in stock_close.columns:
+                value += shares * stock_close.loc[d, code]
+        net_values.append((d, value))
+        last_date = d
+
+    # 最后一段持仓到结束日
+    if last_date and last_date < stock_close.index[-1]:
+        mask = stock_close.index > last_date
+        for day in stock_close.index[mask]:
+            value = cash
+            for code, shares in holdings.items():
+                if code in stock_close.columns:
+                    value += shares * stock_close.loc[day, code]
+            net_values.append((day, value))
+
+    net_df = pd.DataFrame(net_values, columns=['date', 'value']).set_index('date')
+    net_df = net_df[~net_df.index.duplicated()]
+    net_df = net_df.sort_index()
+
+    # 插入初始日期
+    if stock_close.index[0] not in net_df.index:
+        net_df.loc[stock_close.index[0]] = INIT_CASH
+        net_df = net_df.sort_index()
+
+    net_value = net_df['value']
+    perf = calc_performance(net_value, INIT_CASH)
+
+    bench_ret = None
+    if bench_close is not None:
+        bench_ret = (bench_close / bench_close.iloc[0] - 1) * 100
+
+    return perf, bench_ret
+
 def calc_performance(net_value, init_cash, risk_free=0.03):
     returns = net_value.pct_change(fill_method=None).dropna()
     total_return = (net_value.iloc[-1] / init_cash - 1) * 100
@@ -152,56 +236,6 @@ def calc_performance(net_value, init_cash, risk_free=0.03):
         'final_value': net_value.iloc[-1]
     }
 
-def run_backtest(df_daily, df_fin, name_map, start_date, end_date):
-    close_all = df_daily['close'].unstack(level='code')
-    close_all = close_all.loc[start_date:end_date].dropna(axis=1, how='all')
-    bench_close = close_all[BENCH_CODE] if BENCH_CODE in close_all.columns else None
-    stock_close = close_all[[c for c in close_all.columns if c != BENCH_CODE]]
-
-    # 调仓日对齐：取每个周期最后一个真实交易日
-    freq = 'W' if REBALANCE_FREQ == 'W' else 'ME'
-    periods = stock_close.index.to_period(freq)
-    rebalance_dates = stock_close.groupby(periods).apply(lambda x: x.index[-1]).values
-
-    print(f"  回测调仓频率：{freq}，共 {len(rebalance_dates)} 次调仓")
-
-    # 计算每期选股池
-    stock_pools = {}
-    for d_raw in rebalance_dates:
-        d = pd.Timestamp(d_raw)          # 转换为 pandas Timestamp
-        sel = vectorized_select_stocks(df_daily, df_fin, name_map, target_date=d)
-        stock_pools[d] = [s[0] for s in sel if s[0] in stock_close.columns]
-        print(f"    调仓日 {d.date()}，持股 {len(stock_pools[d])} 只")
-
-    # 权重矩阵
-    weights = pd.DataFrame(0.0, index=stock_close.index, columns=stock_close.columns)
-    for d in rebalance_dates:
-        d = pd.Timestamp(d)
-        pool = stock_pools.get(d, [])
-        if pool:
-            weights.loc[d, pool] = 1.0 / len(pool)
-    weights = weights.ffill().fillna(0)
-
-    # 日收益率
-    daily_ret = stock_close.pct_change(fill_method=None).fillna(0)
-
-    # 组合每日收益率
-    portfolio_ret = (weights.shift(1) * daily_ret).sum(axis=1)
-    portfolio_ret.iloc[0] = 0
-
-    # 净值曲线
-    net_value = (1 + portfolio_ret).cumprod() * INIT_CASH
-    net_value.iloc[0] = INIT_CASH
-
-    perf = calc_performance(net_value, INIT_CASH)
-
-    # 基准收益
-    bench_ret = None
-    if bench_close is not None:
-        bench_ret = (bench_close / bench_close.iloc[0] - 1) * 100
-
-    return perf, bench_ret, stock_pools
-
 # ==================== 主流程 ====================
 if __name__ == '__main__':
     conn = sqlite3.connect(DB_PATH)
@@ -211,14 +245,11 @@ if __name__ == '__main__':
     name_map = pd.read_sql("SELECT code, name FROM stock_basic", conn).set_index('code')['name'].to_dict()
     conn.close()
 
+    # 最新选股
     print("\n===== 最新选股 =====")
     selected = vectorized_select_stocks(df_daily, df_fin, name_map)
-
     if not selected:
-        print("\n⚠️ 未选出股票，请尝试放宽条件：")
-        print("   - 降低 CONSECUTIVE_FIN_PERIODS 至 1")
-        print("   - 提高 TOLERANCE 至 0.3")
-        print("   - 降低 MIN_LIQUIDITY 至 1000")
+        print("\n未选出股票，请尝试放宽条件。")
     else:
         print("\n最终选股池（按信号强弱排序）：")
         for code, name, sig in selected:
@@ -233,9 +264,7 @@ if __name__ == '__main__':
     print(f"\n选股结果已导出至 {export_file}")
 
     print("\n===== 运行回测 =====")
-    perf, bench_ret, pools = run_backtest(
-        df_daily, df_fin, name_map, BACKTEST_START, BACKTEST_END
-    )
+    perf, bench_ret = run_backtest(df_daily, df_fin, name_map, BACKTEST_START, BACKTEST_END)
 
     print("\n" + "=" * 50)
     print("回测绩效报告")
