@@ -15,6 +15,7 @@ SELECT code, name FROM stock_basic ORDER BY RANDOM() LIMIT 10;
 
 -- 单只股票样例
 SELECT * FROM daily WHERE code='sh.600519' ORDER BY date DESC LIMIT 5;
+SELECT * FROM financial WHERE code='sh.600519' order by stat_date desc ;
 
 -- 财务数据校验
 SELECT COUNT(*) FROM financial;                 -- 总行数
