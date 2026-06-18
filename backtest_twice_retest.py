@@ -12,7 +12,7 @@ DB_PATH = 'stocks_2y.db'
 BENCH_CODE = 'sh.000300'
 
 # ==================== 可调参数 ====================
-BACKTEST_START = (datetime.now() - timedelta(days=365*2)).strftime('%Y-%m-%d')  # 回测3年
+BACKTEST_START = (datetime.now() - timedelta(days=365*2)).strftime('%Y-%m-%d')  # 回测2年
 BACKTEST_END = datetime.now().strftime('%Y-%m-%d')
 INIT_CASH = 1000000
 MAX_STOCKS = 200               # 控制持仓数量
