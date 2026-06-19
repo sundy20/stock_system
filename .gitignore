@@ -6,3 +6,5 @@ stocks_2y.db
 !/.claude/
 !/.venv/
 !/venv/
+!/selected_stocks_detail.txt
+/selected_stocks_detail.txt
