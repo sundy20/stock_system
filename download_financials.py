@@ -4,7 +4,7 @@ baostock 财务数据下载：单季度净利润同比增长率
 - 数据源为正式季报/年报，不含业绩预告
 - 支持并发下载、自动重试、临时表无冲突写入
 - 获取最近2年所有季度数据，发布后10天生效（消除未来函数）
-- 增加任务超时保护，防止个别股票永久阻塞
+- 内置单任务超时与整体超时，防止个别股票阻塞所有线程
 """
 import baostock as bs
 import sqlite3
@@ -12,17 +12,18 @@ import pandas as pd
 from datetime import datetime
 import time
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
 DB_PATH = 'stocks_2y.db'
 THREAD_NUM = 2              # 并发线程数
 REQUEST_DELAY = 0.2         # 单线程请求间隔（秒）
 MAX_RETRY = 2               # 最大重试次数
 SINGLE_TASK_TIMEOUT = 120   # 单只股票最大处理时间（秒），超时将跳过
+OVERALL_TIMEOUT = 600       # 整体最大等待时间（秒），通常 10 分钟足以；若全部线程卡死则强制终止
 
 CURRENT_YEAR = datetime.now().year
 YEARS = [CURRENT_YEAR - 1, CURRENT_YEAR]
-QUARTERS = [1, 2, 3, 4]     # 全季度覆盖
+QUARTERS = [1, 2, 3, 4]
 
 
 def init_worker():
@@ -91,10 +92,10 @@ def download_single_financial(args):
                     'pub_date': pub_dates.get(stat_date, ''),
                     'stat_date': stat_date,
                     'net_profit_yoy': net_yoy,
-                    'revenue_yoy': None               # 营收留空，兼容旧结构
+                    'revenue_yoy': None
                 })
             return pd.DataFrame(records), None
-        except Exception as e:
+        except Exception:
             time.sleep(0.5)
             continue
     return None, code
@@ -121,8 +122,9 @@ if __name__ == '__main__':
     init_db(conn)
 
     codes = get_mainboard_codes(conn)
-    print(f"下载财务数据，共 {len(codes)} 只股票，{THREAD_NUM} 线程并发，全季度数据")
-    bs.logout()                     # 主线程登出，子线程各自登录
+    total = len(codes)
+    print(f"下载财务数据，共 {total} 只股票，{THREAD_NUM} 线程并发，全季度数据")
+    bs.logout()
 
     success = 0
     failed = []
@@ -130,35 +132,45 @@ if __name__ == '__main__':
     BATCH_SIZE = 50
 
     with ThreadPoolExecutor(max_workers=THREAD_NUM, initializer=init_worker) as executor:
-        # 保存 future -> (code, name) 的映射，用于超时信息输出
         future_to_code = {executor.submit(download_single_financial, task): task for task in codes}
-        for i, future in enumerate(as_completed(future_to_code)):
-            code, name = future_to_code[future]
-            try:
-                result, fail_code = future.result(timeout=SINGLE_TASK_TIMEOUT)
-            except Exception as e:
-                print(f"  ⚠ {code} {name} 处理异常/超时，跳过: {e}", file=sys.stderr)
-                failed.append(code)
-                continue
 
-            if result is not None and not result.empty:
-                batch_buffer.append(result)
-                success += 1
-                if len(batch_buffer) >= BATCH_SIZE:
-                    batch_write_safe(conn, batch_buffer)
-                    batch_buffer = []
-                    print(f"  已完成 {success}/{len(codes)} 只")
-            else:
-                failed.append(fail_code)
+        try:
+            for i, future in enumerate(as_completed(future_to_code, timeout=OVERALL_TIMEOUT)):
+                code, name = future_to_code[future]
+                try:
+                    result, fail_code = future.result(timeout=SINGLE_TASK_TIMEOUT)
+                except Exception as e:
+                    print(f"  ⚠ {code} {name} 处理异常/超时，跳过: {e}", file=sys.stderr)
+                    failed.append(code)
+                    continue
 
-            if (i + 1) % 200 == 0:
-                print(f"  已处理 {i + 1}/{len(codes)}")
+                if result is not None and not result.empty:
+                    batch_buffer.append(result)
+                    success += 1
+                    if len(batch_buffer) >= BATCH_SIZE:
+                        batch_write_safe(conn, batch_buffer)
+                        batch_buffer = []
+                        print(f"  已完成 {success}/{total} 只")
+                else:
+                    failed.append(fail_code)
+
+                if (i + 1) % 200 == 0:
+                    print(f"  已处理 {i + 1}/{total}")
+
+        except FuturesTimeoutError:
+            print(f"\n⚠ 整体超时（{OVERALL_TIMEOUT}秒），剩余任务将被跳过。")
+            # 收集未完成的任务
+            for future in future_to_code:
+                if not future.done():
+                    code, name = future_to_code[future]
+                    print(f"  ⚠ 未完成: {code} {name}", file=sys.stderr)
+                    failed.append(code)
 
     if batch_buffer:
         batch_write_safe(conn, batch_buffer)
 
     conn.commit()
     conn.close()
-    print(f"财务数据下载完成，成功 {success}/{len(codes)} 只")
+    print(f"\n财务数据下载结束，成功 {success}/{total} 只")
     if failed:
         print(f"失败 {len(failed)} 只（示例: {failed[:10]}）")
