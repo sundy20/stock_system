@@ -3,11 +3,10 @@
 选股 + 回测 + 导出 + 绘图（最终版）
 ================================
 选股条件：
-  1. 年线（250日均线）短期斜率 > 0（最近20日变化为正）
-  2. 去年（最近一个完整自然年）放量收红，即视为趋势扭转向上
-  3. 20日日均成交额 >= 2000 万元
-  4. 连续最近2个季度净利润同比增长 > 0（若扣非存在则也需 > 0；若营收存在则也需 > 0）
-  5. 月线/周线技术信号（优先级：周线布林扩张 > 月线布林扩张 > 周线回踩 > 月线回踩）：
+  1. 去年（最近一个完整自然年）放量收红，即视为趋势扭转向上
+  2. 20日日均成交额 >= 2000 万元
+  3. 连续最近2个季度净利润同比增长 > 0（若扣非存在则也需 > 0；若营收存在则也需 > 0）
+  4. 月线/周线技术信号（优先级：周线布林扩张 > 月线布林扩张 > 周线回踩 > 月线回踩）：
      - 布林扩张：短期带宽均线 > 长期带宽均线，且短期均线方向向上
      - 回踩信号：均线附近“靠近”或“跌破”但幅度有限
         · 周线：30根周线内至少2次回踩，均线方向向上，收盘 >= 20周线
@@ -148,11 +147,10 @@ def vectorized_select_stocks(conn, df_daily, df_fin, name_map, target_date=None)
 
     # ---------- 基础指标计算 ----------
     grouped = df_stocks.groupby(level='code')
-    # 250日均线及斜率
+    # 250日均线（保留用于可能的扩展，但不再用于斜率筛选）
     df_stocks['ma250'] = grouped['close'].transform(lambda x: x.rolling(250).mean())
-    df_stocks['ma250_slope'] = grouped['ma250'].transform(lambda x: x.diff(20) / 20)  # 最近20日斜率
-    # 成交额（万元）及20日均值
-    df_stocks['amount_wan'] = df_stocks['amount'] / 10000   # amount 单位：元
+    # 成交额（万元）及20日均值，直接使用 amount 字段（单位：元）
+    df_stocks['amount_wan'] = df_stocks['amount'] / 10000
     df_stocks['amount_ma20'] = grouped['amount_wan'].transform(lambda x: x.rolling(20).mean())
 
     # ---------- 自然年条件计算 ----------
@@ -197,7 +195,7 @@ def vectorized_select_stocks(conn, df_daily, df_fin, name_map, target_date=None)
             red = last_close_all > first_open
             vol_up = True
 
-        # 2. 三年趋势向上：去年放量收红即视为趋势扭转
+        # 2. 趋势向上：去年放量收红即视为趋势扭转
         complete_years = [y for y in years if y < last_year]
         if len(complete_years) >= 1:
             trend_up = red and vol_up
@@ -212,13 +210,12 @@ def vectorized_select_stocks(conn, df_daily, df_fin, name_map, target_date=None)
         r, v, t = check_yearly_conditions(code)
         yearly_ok[code] = (r and v and t)
 
-    # ---------- 基础筛选 ----------
+    # ---------- 基础筛选（已去除年线短期斜率条件） ----------
     latest = df_stocks.groupby(level='code').tail(1)   # 每只股票最新一天的数据
     base_codes = []
     for code in latest.index.get_level_values('code'):
         row = latest.loc[code]
-        if (row['ma250_slope'] > 0 and                    # 年线短期趋势向上
-                yearly_ok.get(code, False) and                # 年线条件通过
+        if (yearly_ok.get(code, False) and                # 年线条件通过
                 row['amount_ma20'] >= MIN_LIQUIDITY):         # 成交额达标
             base_codes.append(code)
 
@@ -294,7 +291,7 @@ def vectorized_select_stocks(conn, df_daily, df_fin, name_map, target_date=None)
     for code in set(w_codes + m_codes):
         if code not in fin_codes:
             continue
-        # 二次确认最新净利润和营收
+        # 二次确认最新净利润和营收（防止数据缺失）
         row = conn.execute("""SELECT net_profit_yoy, revenue_yoy FROM financial
                               WHERE code=? AND net_profit_yoy IS NOT NULL
                               ORDER BY stat_date DESC LIMIT 1""", (code,)).fetchone()
