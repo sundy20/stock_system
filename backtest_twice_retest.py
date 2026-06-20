@@ -423,6 +423,7 @@ if __name__ == '__main__':
     df_daily = load_all_data(conn)
     df_fin = load_financial_data(conn)
     name_map = pd.read_sql("SELECT code, name FROM stock_basic", conn).set_index('code')['name'].to_dict()
+    industry_map = pd.read_sql("SELECT code, industry FROM stock_basic", conn).set_index('code')['industry'].to_dict()
 
     # ---------- 最新选股 ----------
     print("\n===== 最新选股 =====")
@@ -432,7 +433,8 @@ if __name__ == '__main__':
     else:
         print("\n最终选股池（按信号优先级排序）：")
         for c, n, s in selected:
-            print(f"  {c} {n}  信号: {s}")
+            industry = industry_map.get(c, '')
+            print(f"  {c} {n}  行业: {industry}  信号: {s}")
 
     # 导出结果
     with open('selected_stocks.txt', 'w', encoding='utf-8') as f:
@@ -442,7 +444,8 @@ if __name__ == '__main__':
     with open('selected_stocks_detail.txt', 'w', encoding='utf-8') as f:
         for c, n, s in selected:
             plain = c.replace('sh.', '').replace('sz.', '')
-            f.write(f"{plain},{n},{s}\n")
+            industry = industry_map.get(c, '')
+            f.write(f"{plain},{n},{industry},{s}\n")
     print(f"\n结果已导出：selected_stocks.txt 和 selected_stocks_detail.txt")
 
     # ---------- 运行回测 ----------

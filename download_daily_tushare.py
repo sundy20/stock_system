@@ -5,6 +5,7 @@ tushare 日线数据下载（前复权）—— 全字段版，2018年起
 - 全量覆盖 2018-01-01 至今，使用临时表 + INSERT OR REPLACE 避免主键冲突
 - 限速 50 次/分钟，稳定运行
 - 保存字段：open, high, low, close, volume, amount, pct_chg, turn, pre_close
+- 股票信息表 stock_basic 同时保存名称和行业（申万）
 - 自动过滤退市/长期停牌股票（最新交易日距今超过60个自然日）
 """
 import os, time, sqlite3, pandas as pd
@@ -22,8 +23,8 @@ DB_PATH = 'stocks_2y.db'
 START_DATE = '20180101'                     # 数据起始日期（2018年1月1日）
 END_DATE = datetime.now().strftime('%Y%m%d') # 至今日
 CALL_PER_MIN = 50                           # 每分钟最大调用次数
-SLEEP_SEC = 60 / CALL_PER_MIN               # 每次请求最小间隔
-INACTIVE_DAYS = 60                          # 最近交易日距今超过此天数即视为退市/长期停牌
+SLEEP_SEC = 60 / CALL_PER_MIN               # 每次请求最小间隔（秒）
+INACTIVE_DAYS = 60                          # 最近交易日距今超过此天数即视为退市/长期停牌，自动过滤
 
 
 def init_db(conn):
@@ -37,9 +38,9 @@ def init_db(conn):
                                                          open REAL, high REAL, low REAL, close REAL,
                                                          volume REAL, amount REAL, pct_chg REAL, turn REAL, pre_close REAL,
                                                          PRIMARY KEY (code, date))''')
-    # 股票基本信息表
+    # 股票基本信息表（含行业）
     conn.execute('''CREATE TABLE IF NOT EXISTS stock_basic (
-                                                               code TEXT PRIMARY KEY, name TEXT)''')
+                                                               code TEXT PRIMARY KEY, name TEXT, industry TEXT)''')
     conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_code_date ON daily(code, date);")
     conn.commit()
 
@@ -47,28 +48,29 @@ def init_db(conn):
 def get_stock_list_smart(conn):
     """
     获取股票列表，并自动过滤退市/长期停牌股票
-    1. 尝试从 tushare 获取最新列表，成功则更新缓存并返回
+    1. 尝试从 tushare 获取最新列表（含行业），成功则更新缓存并返回
     2. 失败则使用本地 stock_basic 表
     过滤规则：
         - 仅沪深主板（60xxxx/00xxxx），且非 ST
         - 最新交易日距今超过 INACTIVE_DAYS 天的股票将被剔除
     """
     try:
-        print("  正在从 tushare 获取最新股票列表 ...")
-        stocks = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name')
+        print("  正在从 tushare 获取最新股票列表（含行业）...")
+        # 获取股票基本信息，包含行业
+        stocks = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry')
         # 保留主板且非ST
         mask = (stocks['ts_code'].str.match(r'^(60|00)')) & (~stocks['name'].str.contains('ST'))
         df = stocks[mask].copy()
         df['code'] = df['ts_code'].apply(
             lambda x: 'sh.' + x[:6] if x.endswith('.SH') else 'sz.' + x[:6])
-        df = df[['code', 'name']]
+        df = df[['code', 'name', 'industry']]
         # 更新本地缓存
         df.to_sql('stock_basic', conn, if_exists='replace', index=False)
         conn.commit()
         print(f"  ✓ 成功获取 {len(df)} 只股票，缓存已更新")
     except Exception as e:
         print(f"  ⚠ 实时获取失败 ({e})，回退到本地缓存 ...")
-        df = pd.read_sql("SELECT code, name FROM stock_basic", conn)
+        df = pd.read_sql("SELECT code, name, industry FROM stock_basic", conn)
         if df.empty:
             raise RuntimeError("本地缓存为空，且实时获取失败，请稍后重试或检查网络。")
         print(f"  ✓ 使用本地缓存，共 {len(df)} 只股票")
