@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-选股 + 回测 + 导出（核心共振 + 弹性降级两层体系，第二层硬条件放宽）
+选股 + 回测 + 导出（核心共振 + 弹性降级，最终放宽版）
 ================================
 第一层「核心共振」：
     年线趋势 + 流动性 + 月线回踩(≥1次) + 月线布林扩张 + 周线二次回踩(≥2次) + 周线布林扩张 + 财务达标
@@ -10,9 +10,10 @@
         A. 月线布林扩张
         B. 周线二次回踩
         C. 周线二次回踩 + 周线布林扩张
-输出：
-    selected_stocks.txt         → 代码,名称（同花顺导入）
-    selected_stocks_detail.txt  → 代码,名称,行业,层级/信号,20周线,20月线,布林上轨(周),止损参考(10%)
+
+重要调整（与前一版区别）：
+    - 财务条件放宽：扣非净利润若为NULL则跳过检查（不再强制必须存在）
+    - 月线布林扩张放宽：中轨方向不做强制要求（仅要求股价在中轨上方）
 """
 import sqlite3, pandas as pd, numpy as np
 from datetime import datetime, timedelta
@@ -50,23 +51,26 @@ WEEKLY_RETEST_WINDOW = 50
 WEEKLY_RETEST_MIN_GAP = 5
 WEEKLY_RETEST_MIN_TOUCHES = 2  # ★ 二次回踩
 
-# -------------------- 布林扩张（优化后提前捕捉加速） --------------------
+# -------------------- 布林扩张（最终优化版） --------------------
 BB_PERIOD = 20
 BB_STD_MULT = 2
 BB_SHORT_MA = 5                # 带宽短期均线周期
 BB_LONG_MA = 20                # 带宽长期均线周期
 BB_SHORT_DIR_PERIOD = 2        # 带宽短期方向确认（连续2期上升）
-BB_MID_DIR_PERIOD = 3          # 中轨方向计算周期（前3期均值）
-BB_MID_FLAT_OK = True          # 是否允许中轨走平（True=允许）
-# 周线超买限制已取消（设为 None）
+BB_MID_DIR_PERIOD = 3          # 中轨方向计算周期（本版已弱化）
+# 月线布林：不要求中轨方向，仅需股价在中轨上方
+MONTHLY_BB_REQUIRE_MID_UP = False   # ★ 改为 False
+# 周线布林：仍保持中轨走平或向上（可取消，目前设为 True）
+WEEKLY_BB_REQUIRE_MID_UP = True
+WEEKLY_BB_OVERBOUGHT = None    # 超买限制已取消
 
 # -------------------- 均线方向判断（回踩用） --------------------
 MA_DIR_PERIOD = 3              # 当期均线值 > 前3期均值
 
-# -------------------- 财务（初期放宽） --------------------
+# -------------------- 财务（放宽版） --------------------
 FIN_CONSEC = 2                 # 连续季度数
 MIN_PROFIT_YOY = 0.0           # 归母净利润同比 > 0%
-MIN_PNI_YOY = 0.0              # 扣非净利润同比 > 0%（必须存在）
+MIN_PNI_YOY = 0.0              # 扣非净利润同比 > 0%（若存在，否则不检查）
 
 # -------------------- 交易费率 --------------------
 COMMISSION = 0.0001            # 佣金（万1）
@@ -182,12 +186,14 @@ def detect_retest_with_gap(price_df, ma_period, tolerance_down, tolerance_near,
     return has_event & close_ok
 
 
-# ===================== 布林扩张检测 =====================
+# ===================== 布林扩张检测（支持中轨方向可选） =====================
 def detect_bb_expand(price_df, period=20, std_mult=2, short_ma=5, long_ma=20,
-                     mid_dir_period=3, short_dir_period=2, allow_flat_mid=True,
+                     require_mid_up=True, mid_dir_period=3, short_dir_period=2,
                      overbought_limit=None):
     """
-    布林带扩张检测（优化版，提前捕捉加速）
+    布林带扩张检测
+    参数：
+        require_mid_up: 是否要求中轨方向向上（或走平）。True=要求，False=仅要求股价在中轨上方
     """
     close = price_df['close']
     mid = close.rolling(period).mean()
@@ -198,15 +204,20 @@ def detect_bb_expand(price_df, period=20, std_mult=2, short_ma=5, long_ma=20,
     bw_short = bandwidth.rolling(short_ma).mean()
     bw_long = bandwidth.rolling(long_ma).mean()
 
-    if allow_flat_mid:
-        mid_up = mid >= mid.shift(1).rolling(mid_dir_period).mean()
-    else:
-        mid_up = mid > mid.shift(1).rolling(mid_dir_period).mean()
-
+    # 股价在中轨上方（基本要求）
     above_mid = close > mid
-    expanding = (bw_short > bw_long) & (bw_short.diff(short_dir_period) > 0)
 
-    cond = above_mid & mid_up & expanding
+    if require_mid_up:
+        # 中轨方向：当期 ≥ 前 mid_dir_period 期均值（允许走平）
+        mid_up = mid >= mid.shift(1).rolling(mid_dir_period).mean()
+        cond = above_mid & mid_up
+    else:
+        cond = above_mid
+
+    # 带宽扩张
+    expanding = (bw_short > bw_long) & (bw_short.diff(short_dir_period) > 0)
+    cond = cond & expanding
+
     if overbought_limit is not None:
         cond = cond & (close <= upper * overbought_limit)
     return cond
@@ -263,19 +274,27 @@ def vectorized_select_stocks(conn, df_daily, df_fin, name_map, industry_map, tar
     m_low = daily_low.resample('ME').min()
     m_df = pd.DataFrame({'close': m_close.stack(), 'low': m_low.stack()})
 
-    # 月线信号
+    # 月线回踩（至少1次）
     m_retest = detect_retest_with_gap(m_df, 20, MONTHLY_RETEST_DOWN, MONTHLY_RETEST_NEAR,
                                       MONTHLY_RETEST_WINDOW, MONTHLY_RETEST_MIN_GAP,
                                       MONTHLY_RETEST_MIN_TOUCHES, True)
-    m_bb = detect_bb_expand(m_df, BB_PERIOD, BB_STD_MULT, BB_SHORT_MA, BB_LONG_MA,
-                            BB_MID_DIR_PERIOD, BB_SHORT_DIR_PERIOD, BB_MID_FLAT_OK)
 
-    # 周线信号（二次回踩）
+    # 月线布林扩张（放宽：不要求中轨方向）
+    m_bb = detect_bb_expand(m_df, BB_PERIOD, BB_STD_MULT, BB_SHORT_MA, BB_LONG_MA,
+                            require_mid_up=MONTHLY_BB_REQUIRE_MID_UP,
+                            short_dir_period=BB_SHORT_DIR_PERIOD,
+                            overbought_limit=None)
+
+    # 周线回踩（二次回踩）
     w_retest = detect_retest_with_gap(w_df, 20, WEEKLY_RETEST_DOWN, WEEKLY_RETEST_NEAR,
                                       WEEKLY_RETEST_WINDOW, WEEKLY_RETEST_MIN_GAP,
                                       WEEKLY_RETEST_MIN_TOUCHES, True)
+
+    # 周线布林扩张（保持中轨方向要求）
     w_bb = detect_bb_expand(w_df, BB_PERIOD, BB_STD_MULT, BB_SHORT_MA, BB_LONG_MA,
-                            BB_MID_DIR_PERIOD, BB_SHORT_DIR_PERIOD, BB_MID_FLAT_OK)
+                            require_mid_up=WEEKLY_BB_REQUIRE_MID_UP,
+                            short_dir_period=BB_SHORT_DIR_PERIOD,
+                            overbought_limit=WEEKLY_BB_OVERBOUGHT)
 
     def extract_codes(signal_series):
         """从多级索引Series中提取唯一代码列表"""
@@ -291,17 +310,18 @@ def vectorized_select_stocks(conn, df_daily, df_fin, name_map, industry_map, tar
     print(f"月线回踩: {len(m_retest_codes)} 只，月线布林扩张: {len(m_bb_codes)} 只")
     print(f"周线回踩(二次): {len(w_retest_codes)} 只，周线布林扩张: {len(w_bb_codes)} 只")
 
-    # ---------- 财务筛选 ----------
+    # ---------- 财务筛选（放宽版） ----------
     fin_before = df_fin[df_fin['effective_date'] <= target_date]
     if fin_before.empty:
         return [], [], []
     fin_latest = fin_before.sort_values('effective_date').groupby('code').tail(FIN_CONSEC)
+    # 放宽条件：净利润>0，扣非净利润若存在则>0，若为NULL则忽略
     fin_pass = fin_latest.groupby('code').filter(
         lambda x: (len(x) == FIN_CONSEC) and all(x['net_profit_yoy'] > MIN_PROFIT_YOY) and
-                  all(x['yoy_pni'].notna()) and all(x['yoy_pni'] > MIN_PNI_YOY)
+                  all((x['yoy_pni'].isna()) | (x['yoy_pni'] > MIN_PNI_YOY))
     )
     fin_codes = fin_pass['code'].unique().tolist()
-    print(f"财务符合：{len(fin_codes)} 只")
+    print(f"财务符合（扣非缺失也放过）：{len(fin_codes)} 只")
 
     # ---------- 两层分类 ----------
     # 第一层：全共振
@@ -318,9 +338,8 @@ def vectorized_select_stocks(conn, df_daily, df_fin, name_map, industry_map, tar
         assigned.add(code)
         tier1.append((code, '全信号共振'))
 
-    # 第二层：已满足硬条件，检查软条件
+    # 第二层：软条件检查
     for code in sorted(hard_base - assigned):
-        # 软条件
         soft_a = code in m_bb_codes
         soft_b = code in w_retest_codes
         soft_c = soft_b and code in w_bb_codes
