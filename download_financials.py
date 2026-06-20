@@ -1,45 +1,54 @@
 #!/usr/bin/env python3
 """
-baostock 财务数据下载——全字段，超时保护，断网重连
-- 保存所有成长指标：净利润同比、营收同比（留空）、净资产同比、总资产同比、EPS同比、扣非净利润同比
-- 内置单任务超时 + 整体超时 + Socket超时 + 网络异常自动重连，防止线程死锁与断网中断
+baostock 财务数据下载——最终版，双线程，增量更新，防封禁
+- 主线程登录验证，失败直接退出
+- 工作线程独立登录，失败报错
+- 每只股票每次查询前随机等待 0.5~1.5 秒，避免高频被封
+- 网络异常自动重连，重连等待 5~10 秒
+- 增量模式只补充缺失的季度（最近两年，以 net_profit_yoy 是否存在为准）
+- 全量模式：python3 download_financials.py --full
+- 失败记录写入 failed_financial.txt，附具体原因
 """
 import baostock as bs
 import sqlite3
 import pandas as pd
 from datetime import datetime
-import time, sys, socket
+import time, sys, socket, random
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
 # ===================== 配置 =====================
 DB_PATH = 'stocks_2y.db'
-THREAD_NUM = 2                # 并发线程数
-REQUEST_DELAY = 0.2           # 单线程请求间隔（秒）
+THREAD_NUM = 2                # 双线程，日常安全
+REQUEST_MIN_DELAY = 0.5       # 每次查询前最小随机等待（秒）
+REQUEST_MAX_DELAY = 1.5       # 最大随机等待（秒）
 MAX_RETRY = 2                 # 单只股票最大重试次数
-SINGLE_TASK_TIMEOUT = 120     # 单只股票最大处理时间（秒）
-OVERALL_TIMEOUT = 7200        # 整体最大等待时间（秒）= 2小时，确保足够跑完全部
-SOCKET_TIMEOUT = 120          # 全局网络超时（秒），底层Socket读取超时
-
+SINGLE_TASK_TIMEOUT = 180     # 单任务超时（秒）
+SOCKET_TIMEOUT = 180          # 底层 Socket 超时
 CURRENT_YEAR = datetime.now().year
-YEARS = [CURRENT_YEAR - 1, CURRENT_YEAR]   # 查询最近两年
-QUARTERS = [1, 2, 3, 4]
+QUARTERS = [1, 2, 3, 4]      # 季度
 
 
 def reconnect_baostock():
-    """断网重连：登出并重新登录baostock，同时设置Socket超时"""
+    """断网重连：登出并重新登录，随机等待 5~10 秒"""
     try:
         bs.logout()
     except:
         pass
-    time.sleep(1)                         # 等待网络恢复
-    bs.login()
-    socket.setdefaulttimeout(SOCKET_TIMEOUT)   # 重新设置超时
+    wait = random.uniform(5, 10)
+    print(f"  ⚠ 网络异常，{wait:.1f} 秒后重连...", file=sys.stderr)
+    time.sleep(wait)
+    lg = bs.login()
+    if lg.error_code != '0':
+        raise RuntimeError(f"重连失败: {lg.error_msg}")
+    socket.setdefaulttimeout(SOCKET_TIMEOUT)
 
 
 def init_worker():
-    """线程初始化：设置Socket超时并独立登录baostock"""
+    """线程初始化：设置 Socket 超时并登录；失败直接抛出异常"""
     socket.setdefaulttimeout(SOCKET_TIMEOUT)
-    bs.login()
+    lg = bs.login()
+    if lg.error_code != '0':
+        raise RuntimeError(f"线程登录失败: {lg.error_msg}")
 
 
 def get_mainboard_codes(conn):
@@ -49,7 +58,7 @@ def get_mainboard_codes(conn):
 
 
 def init_db(conn):
-    """创建 financial 表（若不存在），包含所有扩展字段"""
+    """创建 financial 表（若不存在）"""
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute('''CREATE TABLE IF NOT EXISTS financial (
                                                              code TEXT, name TEXT,
@@ -61,78 +70,96 @@ def init_db(conn):
     conn.commit()
 
 
+def get_missing_quarters(conn, code):
+    """返回该股票最近两年缺失的季度列表 [(year, quarter, stat_date)]"""
+    existing = {}
+    rows = conn.execute("""
+                        SELECT stat_date, net_profit_yoy FROM financial
+                        WHERE code=? AND stat_date >= ?
+                        """, (code, f"{CURRENT_YEAR-2}-01-01")).fetchall()
+    for sd, net in rows:
+        existing[sd] = net is not None
+
+    missing = []
+    for year in [CURRENT_YEAR - 1, CURRENT_YEAR]:
+        for quarter in QUARTERS:
+            if quarter == 1:
+                sd = f"{year}-03-31"
+            elif quarter == 2:
+                sd = f"{year}-06-30"
+            elif quarter == 3:
+                sd = f"{year}-09-30"
+            else:
+                sd = f"{year}-12-31"
+            if sd not in existing or not existing[sd]:
+                missing.append((year, quarter, sd))
+    return missing
+
+
 def download_single_financial(args):
     """
-    下载单只股票的净利润同比增长率及多项成长指标
-    返回 (DataFrame, 失败代码) 或 (None, 失败代码)
-    遇到网络异常时自动重连并重试
+    下载单只股票指定季度的财务数据，返回 (DataFrame_or_None, fail_code, error_msg)
+    每次查询前随机等待 REQUEST_MIN_DELAY~REQUEST_MAX_DELAY 秒
     """
-    code, name = args
+    code, name, year, quarter = args
+    # ★ 每次查询前随机延迟，避免高频请求
+    time.sleep(random.uniform(REQUEST_MIN_DELAY, REQUEST_MAX_DELAY))
+
     for retry in range(MAX_RETRY + 1):
         try:
-            profit_data, pub_dates, extra = {}, {}, {}
-            for year in YEARS:
-                for quarter in QUARTERS:
-                    rs = bs.query_growth_data(code, year=year, quarter=quarter)
-                    if rs.error_code != '0':
-                        continue
-                    rows = []
-                    while rs.next():
-                        rows.append(rs.get_row_data())
-                    if not rows:
-                        continue
-                    # 字段名统一转为小写方便映射
-                    fields = [f.lower() for f in rs.fields]
-                    df = pd.DataFrame(rows, columns=rs.fields)
-                    # 列名映射（原始字段 → 目标字段）
-                    col_map = {
-                        'yoyni': 'net_profit_yoy', 'yoyequity': 'yoy_equity',
-                        'yoyasset': 'yoy_asset', 'yoyepsbasic': 'yoy_eps', 'yoypni': 'yoy_pni'
-                    }
-                    for orig, target in col_map.items():
-                        if orig in fields:
-                            df[target] = pd.to_numeric(df[rs.fields[fields.index(orig)]], errors='coerce')
-                    pub_date_col = next((f for f in rs.fields if 'pubdate' in f.lower()), None)
-                    stat_date_col = next((f for f in rs.fields if 'statdate' in f.lower()), None)
-                    for _, row in df.iterrows():
-                        if pd.notna(row.get('net_profit_yoy')):
-                            sd = str(pd.to_datetime(row[stat_date_col]).date())
-                            profit_data[sd] = row['net_profit_yoy']
-                            if pub_date_col:
-                                pub_dates[sd] = str(pd.to_datetime(row[pub_date_col]).date())
-                            extra[sd] = {k: row.get(k) for k in ['yoy_equity','yoy_asset','yoy_eps','yoy_pni']}
-            time.sleep(REQUEST_DELAY)
-            if not profit_data:
-                return None, code
+            rs = bs.query_growth_data(code, year=year, quarter=quarter)
+            if rs.error_code != '0':
+                return None, code, f"查询失败: {rs.error_msg}"
+            rows = []
+            while rs.next():
+                rows.append(rs.get_row_data())
+            if not rows:
+                return None, code, "无数据返回"
 
-            records = []
-            for sd, net_yoy in profit_data.items():
-                ex = extra.get(sd, {})
-                records.append({
-                    'code': code, 'name': name,
-                    'pub_date': pub_dates.get(sd, ''),
-                    'stat_date': sd,
-                    'net_profit_yoy': net_yoy,
-                    'revenue_yoy': None,   # baostock 成长数据不含营收增长率，预留
-                    **ex
-                })
-            return pd.DataFrame(records), None
+            fields = [f.lower() for f in rs.fields]
+            df = pd.DataFrame(rows, columns=rs.fields)
+            # 字段映射
+            col_map = {
+                'yoyni': 'net_profit_yoy',
+                'yoyequity': 'yoy_equity',
+                'yoyasset': 'yoy_asset',
+                'yoyepsbasic': 'yoy_eps',
+                'yoypni': 'yoy_pni'
+            }
+            for orig, target in col_map.items():
+                if orig in fields:
+                    df[target] = pd.to_numeric(df[rs.fields[fields.index(orig)]], errors='coerce')
+
+            pub_date_col = next((f for f in rs.fields if 'pubdate' in f.lower()), None)
+            stat_date_col = next((f for f in rs.fields if 'statdate' in f.lower()), None)
+            if not stat_date_col:
+                return None, code, "缺少 stat_date 字段"
+
+            sd = str(pd.to_datetime(df[stat_date_col].iloc[0]).date())
+            record = {
+                'code': code, 'name': name,
+                'pub_date': str(pd.to_datetime(df[pub_date_col].iloc[0]).date()) if pub_date_col else '',
+                'stat_date': sd,
+                'net_profit_yoy': df['net_profit_yoy'].iloc[0] if 'net_profit_yoy' in df.columns else None,
+                'revenue_yoy': None,
+                'yoy_equity': df['yoy_equity'].iloc[0] if 'yoy_equity' in df.columns else None,
+                'yoy_asset': df['yoy_asset'].iloc[0] if 'yoy_asset' in df.columns else None,
+                'yoy_eps': df['yoy_eps'].iloc[0] if 'yoy_eps' in df.columns else None,
+                'yoy_pni': df['yoy_pni'].iloc[0] if 'yoy_pni' in df.columns else None,
+            }
+            return pd.DataFrame([record]), None, None
 
         except (BrokenPipeError, ConnectionError, OSError, socket.timeout) as e:
-            # 网络异常：打印警告，重连后继续重试
-            print(f"  ⚠ {code} {name} 网络异常 ({e})，尝试重连...", file=sys.stderr)
+            print(f"  ⚠ {code} {name} 网络异常 ({e})，准备重连...", file=sys.stderr)
             reconnect_baostock()
-            time.sleep(2)
             continue
-        except Exception:
-            # 其他未知异常，短暂等待后重试
-            time.sleep(0.5)
-            continue
-    return None, code
+        except Exception as e:
+            return None, code, f"{type(e).__name__}: {e}"
+    return None, code, "多次重试后仍失败"
 
 
 def batch_write_safe(conn, df_list):
-    """临时表 + INSERT OR REPLACE 安全批量写入"""
+    """临时表 + INSERT OR REPLACE 批量写入"""
     if not df_list:
         return
     all_df = pd.concat(df_list, ignore_index=True)
@@ -150,60 +177,97 @@ def batch_write_safe(conn, df_list):
 
 
 if __name__ == '__main__':
-    print("登录 baostock ...")
-    bs.login()
+    full_mode = '--full' in sys.argv
+    mode_str = '全量重新下载' if full_mode else '智能增量更新'
+    print(f"登录 baostock ... （{mode_str}）")
+    lg = bs.login()
+    if lg.error_code != '0':
+        print(f"主线程登录失败: {lg.error_msg}")
+        sys.exit(1)
+    print("login success!")
+
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
 
     codes = get_mainboard_codes(conn)
     total = len(codes)
-    print(f"下载财务数据，共 {total} 只股票，{THREAD_NUM} 线程，全季度数据")
-    bs.logout()   # 主线程登出，子线程各自登录
 
-    success = 0
-    failed = []
-    batch_buffer = []
-    BATCH_SIZE = 50
+    # 动态设置整体超时（单任务较慢，适当放宽）
+    OVERALL_TIMEOUT = 3600 if full_mode else 1200
 
+    # 构建任务列表
+    tasks = []
+    skipped = 0
+    for code, name in codes:
+        if full_mode:
+            for y in [CURRENT_YEAR - 1, CURRENT_YEAR]:
+                for q in QUARTERS:
+                    tasks.append((code, name, y, q))
+        else:
+            missing = get_missing_quarters(conn, code)
+            for year, quarter, sd in missing:
+                tasks.append((code, name, year, quarter))
+            if not missing:
+                skipped += 1
+
+    print(f"共 {total} 只股票，{len(tasks)} 个季度任务，已跳过 {skipped} 只完整股票")
+    if not tasks:
+        print("全部财务数据已是最新，无需下载。")
+        bs.logout()
+        conn.close()
+        sys.exit(0)
+
+    print(f"{THREAD_NUM} 线程，整体超时 {OVERALL_TIMEOUT} 秒，请求间隔 {REQUEST_MIN_DELAY}~{REQUEST_MAX_DELAY} 秒")
+    bs.logout()  # 主线程登出
+
+    success, failed_stocks, batch_buffer = 0, {}, []
     with ThreadPoolExecutor(max_workers=THREAD_NUM, initializer=init_worker) as executor:
-        # 保存 future -> (code, name) 映射，用于超时信息输出
-        future_to_code = {executor.submit(download_single_financial, task): task for task in codes}
+        future_to_code = {executor.submit(download_single_financial, t): t for t in tasks}
         try:
             for i, future in enumerate(as_completed(future_to_code, timeout=OVERALL_TIMEOUT)):
-                code, name = future_to_code[future]
+                task = future_to_code[future]
+                code, name, _, _ = task
                 try:
-                    result, fail_code = future.result(timeout=SINGLE_TASK_TIMEOUT)
+                    result, fail_code, err_msg = future.result(timeout=SINGLE_TASK_TIMEOUT)
                 except Exception as e:
-                    print(f"  ⚠ {code} {name} 处理异常/超时，跳过: {e}", file=sys.stderr)
-                    failed.append(code)
+                    err_msg = f"Future 异常: {type(e).__name__}: {e}"
+                    failed_stocks[code] = err_msg
+                    print(f"  ⚠ {code} {name} {err_msg}", file=sys.stderr)
                     continue
 
                 if result is not None and not result.empty:
                     batch_buffer.append(result)
                     success += 1
-                    if len(batch_buffer) >= BATCH_SIZE:
+                    if len(batch_buffer) >= 50:
                         batch_write_safe(conn, batch_buffer)
                         batch_buffer = []
-                        print(f"  已完成 {success}/{total} 只")
+                        print(f"  已完成 {success}/{len(tasks)} 个季度")
                 else:
-                    failed.append(fail_code)
+                    if code not in failed_stocks:
+                        failed_stocks[code] = err_msg
+                    print(f"  ✗ {code} {name} 失败: {err_msg}")
 
                 if (i + 1) % 200 == 0:
-                    print(f"  已处理 {i + 1}/{total}")
+                    print(f"  已处理 {i + 1}/{len(tasks)}")
 
         except FuturesTimeoutError:
-            print(f"\n⚠ 整体超时（{OVERALL_TIMEOUT}秒），剩余任务将被跳过。")
+            print(f"\n⚠ 整体超时（{OVERALL_TIMEOUT}秒），剩余任务跳过")
             for future in future_to_code:
                 if not future.done():
-                    code, name = future_to_code[future]
-                    print(f"  ⚠ 未完成: {code} {name}", file=sys.stderr)
-                    failed.append(code)
+                    task = future_to_code[future]
+                    failed_stocks[task[0]] = "整体超时未完成"
 
     if batch_buffer:
         batch_write_safe(conn, batch_buffer)
-
     conn.commit()
     conn.close()
-    print(f"\n财务数据下载结束，成功 {success}/{total} 只")
-    if failed:
-        print(f"失败 {len(failed)} 只（示例: {failed[:10]}）")
+
+    print(f"\n成功 {success}/{len(tasks)} 个季度")
+    if failed_stocks:
+        print(f"失败股票 {len(failed_stocks)} 只，详情写入 failed_financial.txt")
+        with open('failed_financial.txt', 'w') as f:
+            for code, reason in failed_stocks.items():
+                f.write(f"{code},{reason}\n")
+        print("前10条失败示例:")
+        for code, reason in list(failed_stocks.items())[:10]:
+            print(f"  {code}: {reason}")

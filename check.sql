@@ -9,7 +9,7 @@ SELECT code, date, close, amount FROM daily WHERE code='sh.600519' ORDER BY date
 SELECT code, name, industry, list_date FROM stock_basic LIMIT 10;
 
 -- 查看某只股票最近日线（如茅台）
-SELECT * FROM daily WHERE code='sh.600519' ORDER BY date DESC LIMIT 5;
+SELECT * FROM daily WHERE code='sh.000300' ORDER BY date DESC LIMIT 5;
 SELECT * FROM daily;
 
 -- 财务表基础信息
@@ -36,4 +36,6 @@ FROM daily WHERE code='sh.603799';
 -- 近两季净利润
 SELECT stat_date, net_profit_yoy FROM financial
 WHERE code='sh.603799' ORDER BY stat_date DESC LIMIT 4;
+
+DELETE FROM stock_basic WHERE code IN ('sz.001331','sh.600228','sh.600717','sh.603137','sh.603159','sh.603721');
 

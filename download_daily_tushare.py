@@ -1,25 +1,31 @@
 #!/usr/bin/env python3
 """
-tushare 日线数据下载（前复权）—— 全字段版，2018年起
-- 含上市日期、行业信息，自动过滤退市/长期停牌股
-- 保存字段：open,high,low,close,volume,amount,pct_chg,turn,pre_close
+tushare 日线数据下载（前复权）—— 最终版，智能增量，面向失败设计
+- 默认增量模式：仅下载缺失数据（与数据库最新交易日的差距）
+- 全量模式：python3 download_daily_tushare.py --full  强制从2018年起全量重新下载
+- 自动过滤 ST / 退市 / 长期停牌（最新交易日距今>60天）股票
+- 保存字段：open,high,low,close,volume,amount(元),pct_chg,turn(暂填0),pre_close
+- 限速 50次/分钟，使用临时表 + INSERT OR REPLACE 写入
+- 股票列表自动更新到 stock_basic 表（含行业、上市日期）
+- 失败股票输出到 failed_daily.txt，附带具体异常信息
+- 沪深300指数使用 index_daily 接口单独处理
 """
-import os, time, sqlite3, pandas as pd
+import os, sys, time, sqlite3, pandas as pd
 from datetime import datetime, timedelta
 import tushare as ts
 
+# ===================== 配置 =====================
 TOKEN = os.getenv('TUSHARE_TOKEN')
 if not TOKEN:
-    raise RuntimeError("请先设置 TUSHARE_TOKEN")
+    raise RuntimeError("请先设置环境变量 TUSHARE_TOKEN")
 ts.set_token(TOKEN)
 pro = ts.pro_api()
 
 DB_PATH = 'stocks_2y.db'
-START_DATE = '20180101'
-END_DATE = datetime.now().strftime('%Y%m%d')
-CALL_PER_MIN = 50
-SLEEP_SEC = 60 / CALL_PER_MIN
-INACTIVE_DAYS = 60          # 超60天无交易视为退市/停牌
+FULL_START_DATE = '20180101'        # 全量下载的起始日期
+CALL_PER_MIN = 50                   # 每分钟最大请求数
+SLEEP_SEC = 60 / CALL_PER_MIN       # 两次请求最小间隔（秒）
+INACTIVE_DAYS = 60                  # 退市判定：最新交易日距今超过此天数即过滤
 
 
 def init_db(conn):
@@ -40,8 +46,11 @@ def init_db(conn):
 
 def get_stock_list_smart(conn):
     """
-    获取活跃股票列表，含行业和上市日期，并过滤退市/停牌股
-    要求：主板、非ST、最新交易日距今≤INACTIVE_DAYS
+    获取活跃股票列表（含行业、上市日期）
+    1. 从tushare拉取最新股票列表，失败则用本地缓存
+    2. 仅保留沪深主板（60/00开头）且非ST
+    3. 过滤退市/长期停牌：最新交易日距今 > INACTIVE_DAYS 的股票被剔除
+    返回 DataFrame（code, name, industry, list_date）
     """
     try:
         print("  从tushare获取最新股票列表...")
@@ -54,7 +63,7 @@ def get_stock_list_smart(conn):
         df = df[['code', 'name', 'industry', 'list_date']]
         df.to_sql('stock_basic', conn, if_exists='replace', index=False)
         conn.commit()
-        print(f"  ✓ 获取 {len(df)} 只股票")
+        print(f"  ✓ 获取 {len(df)} 只股票，缓存已更新")
     except Exception as e:
         print(f"  ⚠ 获取失败 ({e})，使用本地缓存")
         df = pd.read_sql("SELECT code, name, industry, list_date FROM stock_basic", conn)
@@ -73,32 +82,75 @@ def get_stock_list_smart(conn):
         print(f"  ⚠ 过滤掉 {len(removed)} 只退市/停牌股: {removed['code'].tolist()}")
     df = df[df['code'].isin(active)]
     print(f"  ✓ 最终活跃股票 {len(df)} 只")
-    return list(zip(df['code'], df['name']))
+    return df
 
 
-def download_one(code):
-    """下载单只股票全部日线数据"""
-    ts_code = code[3:] + '.SH' if code.startswith('sh.') else code[3:] + '.SZ'
+def get_latest_date(conn, code):
+    """查询某只股票在 daily 表中的最新日期，若无返回 None"""
+    row = conn.execute("SELECT MAX(date) FROM daily WHERE code=?", (code,)).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def get_market_latest_date(conn):
+    """获取数据库中所有股票的最大日期，作为最近交易日"""
+    row = conn.execute("SELECT MAX(date) FROM daily").fetchone()
+    if row and row[0]:
+        return row[0]
+    return FULL_START_DATE
+
+
+def download_one(code, start_date):
+    """
+    下载单只股票/指数从 start_date 至今的前复权日线
+    返回 (DataFrame, error_msg)
+    """
     if code == 'sh.000300':
-        ts_code = '000300.SH'
-    try:
-        df = pro.daily(ts_code=ts_code, start_date=START_DATE, end_date=END_DATE, adj='qfq')
+        # 沪深300指数使用 index_daily 接口
+        try:
+            df = pro.index_daily(ts_code='000300.SH',
+                                 start_date=start_date.replace('-', ''),
+                                 end_date=datetime.now().strftime('%Y%m%d'))
+            if df.empty:
+                return None, "沪深300指数无数据"
+            df = df.rename(columns={'trade_date': 'date', 'vol': 'volume'})
+            if 'amount' not in df.columns:
+                df['amount'] = 0.0
+            df['date'] = pd.to_datetime(df['date'], format='%Y%m%d').dt.strftime('%Y-%m-%d')
+            df['volume'] = (df['volume'] * 100).astype(int)
+            df['amount'] = df['amount'].astype(float)
+            df['pct_chg'] = df['pct_chg'].astype(float) if 'pct_chg' in df.columns else 0.0
+            df['turn'] = 0.0
+            df['pre_close'] = df['pre_close'].astype(float) if 'pre_close' in df.columns else 0.0
+            df = df[['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'turn', 'pre_close']]
+            df['code'] = code
+            return df, None
+        except Exception as e:
+            return None, f"沪深300指数下载失败: {type(e).__name__}: {e}"
+    else:
+        ts_code = code[3:] + '.SH' if code.startswith('sh.') else code[3:] + '.SZ'
+        try:
+            df = pro.daily(ts_code=ts_code,
+                           start_date=start_date.replace('-', ''),
+                           end_date=datetime.now().strftime('%Y%m%d'),
+                           adj='qfq')
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"
         if df.empty:
-            return None
+            return None, f"返回空数据 (可能无此代码或退市)"
+        # 统一处理字段
         df = df.rename(columns={'trade_date': 'date', 'vol': 'volume'})
         df['date'] = pd.to_datetime(df['date'], format='%Y%m%d').dt.strftime('%Y-%m-%d')
-        df['volume'] = (df['volume'] * 100).astype(int)          # 手->股
-        df['amount'] = (df['amount'] * 1000).astype(float)       # 千元->元
+        df['volume'] = (df['volume'] * 100).astype(int)
+        df['amount'] = (df['amount'] * 1000).astype(float)
         df['pct_chg'] = df['pct_chg'].astype(float)
         df['turn'] = 0.0
         df = df[['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'turn', 'pre_close']]
         df['code'] = code
-        return df
-    except Exception:
-        return None
+        return df, None
 
 
 def safe_batch_write(conn, df_list):
+    """临时表 + INSERT OR REPLACE 批量写入，避免主键冲突"""
     if not df_list:
         return
     all_df = pd.concat(df_list, ignore_index=True)
@@ -114,23 +166,60 @@ def safe_batch_write(conn, df_list):
 
 
 if __name__ == '__main__':
-    print(f"tushare 日线下载：{START_DATE} 至 {END_DATE}")
+    full_mode = '--full' in sys.argv
+    start_msg = "全量重新下载" if full_mode else "智能增量更新"
+    print(f"tushare 日线下载：{start_msg}模式")
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
 
-    codes = get_stock_list_smart(conn)
-    codes.append(('sh.000300', '沪深300'))
+    # 1. 获取活跃股票列表
+    stock_info = get_stock_list_smart(conn)
+    # 添加沪深300作为基准
+    stock_info = pd.concat([stock_info, pd.DataFrame([{
+        'code': 'sh.000300', 'name': '沪深300', 'industry': '', 'list_date': ''
+    }])], ignore_index=True)
 
-    print(f"共 {len(codes)} 只标的，限速 {CALL_PER_MIN} 次/分钟")
-    success, failed, batch = 0, [], []
+    # 2. 获取市场最近交易日
+    market_last_date = get_market_latest_date(conn)
+    print(f"  市场最近交易日: {market_last_date}")
+
+    # 3. 确定每只股票需要下载的起始日期
+    task_list = []
+    skipped = 0
+    for _, row in stock_info.iterrows():
+        code = row['code']
+        name = row['name']
+        if full_mode:
+            task_list.append((code, name, FULL_START_DATE))
+        else:
+            last_date = get_latest_date(conn, code)
+            if last_date is None:
+                # 没有任何数据，全量下载
+                task_list.append((code, name, FULL_START_DATE))
+            elif last_date < market_last_date:
+                # 数据落后，补最近缺失
+                next_date = (pd.to_datetime(last_date) + timedelta(days=1)).strftime('%Y-%m-%d')
+                task_list.append((code, name, next_date))
+            else:
+                skipped += 1
+
+    print(f"共需处理 {len(task_list)} 只股票，已跳过 {skipped} 只最新股票")
+    if not task_list:
+        print("全部数据已是最新，无需下载。")
+        conn.close()
+        sys.exit(0)
+
+    print(f"限速 {CALL_PER_MIN} 次/分钟，预计耗时 {len(task_list)/CALL_PER_MIN:.1f} 分钟")
+
+    success, failed_list, batch = 0, [], []
     last_time = time.time()
-    for code, name in codes:
+    for code, name, start_date in task_list:
         elapsed = time.time() - last_time
         if elapsed < SLEEP_SEC:
             time.sleep(SLEEP_SEC - elapsed)
         last_time = time.time()
 
-        df = download_one(code)
+        df, err_msg = download_one(code, start_date)
         if df is not None and not df.empty:
             df['name'] = name
             batch.append(df)
@@ -138,19 +227,24 @@ if __name__ == '__main__':
             if len(batch) >= 50:
                 safe_batch_write(conn, batch)
                 batch = []
-                print(f"  已完成 {success}/{len(codes)} 只")
+                print(f"  已完成 {success}/{len(task_list)} 只")
         else:
-            failed.append(code)
+            failed_list.append((code, name, err_msg))
+            print(f"  ✗ {code} {name} 失败: {err_msg}")
 
-        if (success + len(failed)) % 200 == 0:
-            print(f"  已处理 {success+len(failed)}/{len(codes)}")
+        if (success + len(failed_list)) % 200 == 0:
+            print(f"  已处理 {success+len(failed_list)}/{len(task_list)}")
 
     if batch:
         safe_batch_write(conn, batch)
 
     conn.close()
-    print(f"下载完成，成功 {success}/{len(codes)} 只")
-    if failed:
-        print(f"失败 {len(failed)} 只，已写入 failed_daily.txt")
+    print(f"\n下载完成，成功 {success}/{len(task_list)} 只")
+    if failed_list:
+        print(f"失败 {len(failed_list)} 只，详情写入 failed_daily.txt")
         with open('failed_daily.txt', 'w') as f:
-            f.write('\n'.join(failed))
+            for code, name, reason in failed_list:
+                f.write(f"{code},{name},{reason}\n")
+        print("前10条失败示例:")
+        for code, name, reason in failed_list[:10]:
+            print(f"  {code} {name}: {reason}")

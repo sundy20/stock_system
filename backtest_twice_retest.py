@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-选股 + 回测 + 导出（中线趋势升级版，最终参数）
-策略条件：
-  前置剔除：上市≥24月、非ST、近20日停牌≤2天
-  年度趋势（任一条满足）：
-    A. 滚动12个月涨幅≥15%且放量≥30%，收盘价≥年线，年线斜率≥0
-    B. 上一个完整自然年收红且放量
-  流动性：20日均成交≥2000万，120日均成交≥1500万
-  财务（初期放宽）：连续2季度归母净利润同比>0%，扣非净利润同比>0%（必须存在）
-  技术信号（优先级：周线回踩 > 月线回踩 > 周线布林扩张 > 月线布林扩张）
-    回踩：均线向上，有效回踩（下探≤X% 或 靠近≤Y%），间隔计数
-    布林扩张：中轨向上，标准化带宽短期均线上穿长期且方向向上，周线超买≤布林上轨×1.10
-输出：selected_stocks.txt, selected_stocks_detail.txt（含止损止盈参考线）
+选股 + 回测 + 导出（核心共振 + 弹性降级两层体系，第二层硬条件放宽）
+================================
+第一层「核心共振」：
+    年线趋势 + 流动性 + 月线回踩(≥1次) + 月线布林扩张 + 周线二次回踩(≥2次) + 周线布林扩张 + 财务达标
+第二层「弹性降级」：
+    硬条件：年线趋势 + 流动性 + (月线回踩≥1次 或 周线二次回踩) + 财务达标
+    软条件（至少满足一项）：
+        A. 月线布林扩张
+        B. 周线二次回踩
+        C. 周线二次回踩 + 周线布林扩张
+输出：
+    selected_stocks.txt         → 代码,名称（同花顺导入）
+    selected_stocks_detail.txt  → 代码,名称,行业,层级/信号,20周线,20月线,布林上轨(周),止损参考(10%)
 """
 import sqlite3, pandas as pd, numpy as np
 from datetime import datetime, timedelta
@@ -25,50 +26,58 @@ BACKTEST_END = datetime.now().strftime('%Y-%m-%d')
 INIT_CASH = 1_000_000
 MAX_STOCKS = 200
 
-# 流动性
-MIN_20D_AMOUNT = 2000          # 万元
-MIN_120D_AMOUNT = 1500         # 万元
+# -------------------- 流动性 --------------------
+MIN_20D_AMOUNT = 2000          # 20日均成交额 ≥ 2000万元
+MIN_120D_AMOUNT = 1500         # 120日均成交额 ≥ 1500万元
 
-# 年度趋势滚动参数
-ROLLING_DAYS = 250             # 近似12个月
-ROLLING_PRICE_UP = 0.15        # 滚动涨幅≥15%
-ROLLING_VOL_UP = 0.30          # 滚动日均成交额增长≥30%
-MA_SLOPE_THRESHOLD = 0         # 年线斜率≥0
+# -------------------- 年度趋势（滚动+自然年） --------------------
+ROLLING_DAYS = 250             # 滚动周期，近似12个月
+ROLLING_PRICE_UP = 0.15        # 滚动涨幅 ≥ 15%
+ROLLING_VOL_UP = 0.30          # 滚动日均成交额增长 ≥ 30%
+MA_SLOPE_THRESHOLD = 0         # 年线斜率 ≥ 0（走平或向上）
 
-# 回踩参数
-WEEKLY_RETEST_DOWN = 0.08      # 周线下探阈值≤8%
-WEEKLY_RETEST_NEAR = 0.05      # 周线靠近阈值≤5%
-WEEKLY_RETEST_WINDOW = 50      # 统计窗口（根）
-WEEKLY_RETEST_MIN_GAP = 5      # 两次回踩最小间隔
-MONTHLY_RETEST_DOWN = 0.12     # 月线下探≤12%
-MONTHLY_RETEST_NEAR = 0.08     # 月线靠近≤8%
-MONTHLY_RETEST_WINDOW = 18
-MONTHLY_RETEST_MIN_GAP = 3
+# -------------------- 月线回踩（至少1次） --------------------
+MONTHLY_RETEST_DOWN = 0.12     # 下探幅度 ≤ 12%
+MONTHLY_RETEST_NEAR = 0.08     # 靠近幅度 ≤ 8%
+MONTHLY_RETEST_WINDOW = 18     # 观察窗口（根月K线）
+MONTHLY_RETEST_MIN_GAP = 3     # 两次回踩最小间隔（根）
+MONTHLY_RETEST_MIN_TOUCHES = 1 # 最少回踩次数
 
-# 布林参数
+# -------------------- 周线回踩（至少2次，即二次回踩） --------------------
+WEEKLY_RETEST_DOWN = 0.12
+WEEKLY_RETEST_NEAR = 0.08
+WEEKLY_RETEST_WINDOW = 50
+WEEKLY_RETEST_MIN_GAP = 5
+WEEKLY_RETEST_MIN_TOUCHES = 2  # ★ 二次回踩
+
+# -------------------- 布林扩张（优化后提前捕捉加速） --------------------
 BB_PERIOD = 20
 BB_STD_MULT = 2
-BB_SHORT_MA = 5
-BB_LONG_MA = 20
-BB_OVERBOUGHT = 1.10           # 周线超买限制（最终放宽至1.10）
+BB_SHORT_MA = 5                # 带宽短期均线周期
+BB_LONG_MA = 20                # 带宽长期均线周期
+BB_SHORT_DIR_PERIOD = 2        # 带宽短期方向确认（连续2期上升）
+BB_MID_DIR_PERIOD = 3          # 中轨方向计算周期（前3期均值）
+BB_MID_FLAT_OK = True          # 是否允许中轨走平（True=允许）
+# 周线超买限制已取消（设为 None）
 
-# 均线方向：当期 > 前3期均值
-MA_DIR_PERIOD = 3
+# -------------------- 均线方向判断（回踩用） --------------------
+MA_DIR_PERIOD = 3              # 当期均线值 > 前3期均值
 
-# 财务（初期放宽）
-FIN_CONSEC = 2
-MIN_PROFIT_YOY = 0.0           # >0%
-MIN_PNI_YOY = 0.0              # >0%，必须存在
+# -------------------- 财务（初期放宽） --------------------
+FIN_CONSEC = 2                 # 连续季度数
+MIN_PROFIT_YOY = 0.0           # 归母净利润同比 > 0%
+MIN_PNI_YOY = 0.0              # 扣非净利润同比 > 0%（必须存在）
 
-# 交易费率
-COMMISSION = 0.0001
-SLIPPAGE = 0.001
-STAMP_DUTY = 0.001
-REBALANCE_FREQ = 'W'
+# -------------------- 交易费率 --------------------
+COMMISSION = 0.0001            # 佣金（万1）
+SLIPPAGE = 0.001               # 滑点
+STAMP_DUTY = 0.001             # 卖出印花税
+REBALANCE_FREQ = 'W'           # 调仓频率（W=周）
 
 
 # ===================== 数据加载 =====================
 def load_all_data(conn):
+    """加载2018年至今的日线数据，返回 multi-index (code, date) 的 DataFrame"""
     query = """SELECT code, date, open, high, low, close, volume, amount
                FROM daily WHERE date >= '2018-01-01' ORDER BY code, date"""
     df = pd.read_sql(query, conn, parse_dates=['date'])
@@ -76,6 +85,7 @@ def load_all_data(conn):
 
 
 def load_financial_data(conn):
+    """加载财务数据，计算生效日期（pub_date + 10天）"""
     query = """SELECT code, stat_date, pub_date, net_profit_yoy, revenue_yoy, yoy_pni
                FROM financial WHERE net_profit_yoy IS NOT NULL ORDER BY code, stat_date"""
     df = pd.read_sql(query, conn, parse_dates=['stat_date', 'pub_date'])
@@ -85,44 +95,44 @@ def load_financial_data(conn):
 
 # ===================== 前置剔除 =====================
 def get_valid_codes(conn, df_daily, target_date):
-    """返回符合前置剔除条件的股票代码列表"""
-    # 1. 上市满24个月（利用stock_basic中的list_date）
+    """
+    返回符合前置剔除条件的股票代码列表：
+    - 上市 ≥ 24 个月
+    - 近 20 个交易日停牌天数 ≤ 2 天
+    """
     basic = pd.read_sql("SELECT code, list_date FROM stock_basic", conn, parse_dates=['list_date'])
     basic['months'] = ((target_date - basic['list_date']).dt.days / 30.44)
     valid_listed = basic[basic['months'] >= 24]['code'].tolist()
 
-    # 2. 非ST（已在获取列表时过滤）
-    # 3. 近20个交易日停牌天数 ≤ 2天
     df_recent = df_daily.loc[df_daily.index.get_level_values('date') >= target_date - timedelta(days=40)]
     trading_days = df_recent.groupby(level='code').size()
-    # 最近20个交易日应有约20条记录，缺失天数 ≤ 2
     valid_trading = trading_days[trading_days >= 18].index.tolist()
 
     return list(set(valid_listed) & set(valid_trading))
 
 
-# ===================== 年度趋势条件（滚动+自然年融合） =====================
+# ===================== 年度趋势 =====================
 def check_annual_trend(code, df_stocks, target_date, yearly_data):
-    """返回是否满足年度趋势（滚动或自然年任一）"""
+    """
+    检查年线趋势（滚动或自然年任一满足即可）
+    - 滚动：最近250交易日涨幅≥15%且日均成交额增长≥30%，收盘价≥250日均线，斜率≥0
+    - 自然年：上一个完整自然年收红且放量
+    """
     code_data = df_stocks.loc[code].sort_index()
-    # ---- 滚动12个月验证 ----
     rolling_ok = False
+
     if len(code_data) >= ROLLING_DAYS * 2:
         recent = code_data.iloc[-ROLLING_DAYS:]
         prev = code_data.iloc[-2*ROLLING_DAYS:-ROLLING_DAYS]
-        # 价格涨幅
         price_up = (recent['close'].iloc[-1] - prev['close'].iloc[-1]) / prev['close'].iloc[-1] >= ROLLING_PRICE_UP
-        # 量能放大：日均成交额增长
         vol_ratio = recent['amount'].mean() / prev['amount'].mean() - 1
         vol_up = vol_ratio >= ROLLING_VOL_UP
-        # 年线位置与斜率
         ma250 = code_data['close'].rolling(250).mean()
         above_ma = code_data['close'].iloc[-1] >= ma250.iloc[-1]
         slope = (ma250.iloc[-1] - ma250.iloc[-20]) / 20 if len(ma250) >= 20 else -1
         slope_ok = slope >= MA_SLOPE_THRESHOLD
         rolling_ok = price_up and vol_up and above_ma and slope_ok
 
-    # ---- 自然年验证（去年放量收红） ----
     natural_ok = False
     if code in yearly_data.index.get_level_values('code'):
         df_y = yearly_data.loc[code].sort_index()
@@ -136,174 +146,204 @@ def check_annual_trend(code, df_stocks, target_date, yearly_data):
             else:
                 vol_up = True
             natural_ok = red and vol_up
+
     return rolling_ok or natural_ok
 
 
-# ===================== 回踩信号检测（含间隔计数） =====================
+# ===================== 回踩检测 =====================
 def detect_retest_with_gap(price_df, ma_period, tolerance_down, tolerance_near,
-                           window, min_gap, require_ma_up=True):
+                           window, min_gap, min_touches=1, require_ma_up=True):
+    """
+    均线回踩信号检测（支持最少回踩次数和间隔计数）
+    参数：
+        min_touches: 最少回踩次数（月线1次，周线2次）
+        require_ma_up: 是否要求均线方向向上
+    返回布尔Series
+    """
     close = price_df['close']
     low = price_df['low']
     ma = close.rolling(ma_period).mean()
 
-    # 均线方向：当期 > 前3期均值
     if require_ma_up:
         ma_up = ma > ma.shift(1).rolling(MA_DIR_PERIOD).mean()
     else:
         ma_up = pd.Series(True, index=ma.index)
 
-    # 有效回踩事件
     touch_down = (low < ma) & ((ma - low) / ma <= tolerance_down)
     touch_near = (low >= ma) & ((low - ma) / ma <= tolerance_near)
     touch = (touch_down | touch_near) & ma_up
 
-    # 间隔计数：连续满足只计1次，两次事件间隔至少min_gap根K线
     touch_int = touch.astype(int)
-    # 标记事件开始：当前为1且前一根为0，或者是第一根K线即为1
     event_start = (touch_int.diff() == 1) | (touch_int == 1)
-    # 计数：用rolling sum统计窗口内的事件开始次数
     event_count = event_start.rolling(window, min_periods=1).sum()
-    has_event = event_count >= 1
+    has_event = event_count >= min_touches
+
     close_ok = close >= ma
     return has_event & close_ok
 
 
-# ===================== 布林扩张检测（标准化带宽，中轨方向） =====================
+# ===================== 布林扩张检测 =====================
 def detect_bb_expand(price_df, period=20, std_mult=2, short_ma=5, long_ma=20,
+                     mid_dir_period=3, short_dir_period=2, allow_flat_mid=True,
                      overbought_limit=None):
+    """
+    布林带扩张检测（优化版，提前捕捉加速）
+    """
     close = price_df['close']
     mid = close.rolling(period).mean()
     std = close.rolling(period).std()
     upper = mid + std_mult * std
     lower = mid - std_mult * std
-    bandwidth = (upper - lower) / mid          # 标准化带宽
+    bandwidth = (upper - lower) / mid
     bw_short = bandwidth.rolling(short_ma).mean()
     bw_long = bandwidth.rolling(long_ma).mean()
-    # 中轨方向
-    mid_up = mid > mid.shift(1).rolling(MA_DIR_PERIOD).mean()
-    # 股价在中轨上方
+
+    if allow_flat_mid:
+        mid_up = mid >= mid.shift(1).rolling(mid_dir_period).mean()
+    else:
+        mid_up = mid > mid.shift(1).rolling(mid_dir_period).mean()
+
     above_mid = close > mid
-    # 带宽扩张
-    expanding = (bw_short > bw_long) & (bw_short.diff(3) > 0)
+    expanding = (bw_short > bw_long) & (bw_short.diff(short_dir_period) > 0)
+
     cond = above_mid & mid_up & expanding
-    if overbought_limit:
+    if overbought_limit is not None:
         cond = cond & (close <= upper * overbought_limit)
     return cond
 
 
-# ===================== 选股主逻辑 =====================
+# ===================== 选股主逻辑（两层体系） =====================
 def vectorized_select_stocks(conn, df_daily, df_fin, name_map, industry_map, target_date=None):
     if target_date is None:
         target_date = df_daily.index.get_level_values('date').max()
     target_date = pd.Timestamp(target_date)
 
-    # 前置剔除
+    # ---------- 前置剔除 + 年线流动性 ----------
     valid_codes = get_valid_codes(conn, df_daily, target_date)
     df_stocks = df_daily[df_daily.index.get_level_values('code').isin(valid_codes)].copy()
     if df_stocks.empty:
         print("前置剔除后无股票")
-        return []
+        return [], [], []
 
-    # 基础指标
     grouped = df_stocks.groupby(level='code')
     df_stocks['amount_wan'] = df_stocks['amount'] / 10000
     df_stocks['amount_ma20'] = grouped['amount_wan'].transform(lambda x: x.rolling(20).mean())
     df_stocks['amount_ma120'] = grouped['amount_wan'].transform(lambda x: x.rolling(120).mean())
     df_stocks['year'] = df_stocks.index.get_level_values('date').year
     yearly = df_stocks.groupby(['code', 'year']).agg(
-        first_open=('open', 'first'),
-        last_close=('close', 'last'),
-        total_volume=('volume', 'sum')
+        first_open=('open', 'first'), last_close=('close', 'last'), total_volume=('volume', 'sum')
     ).sort_index()
 
-    # 年度趋势
-    annual_ok = {}
-    for code in valid_codes:
-        annual_ok[code] = check_annual_trend(code, df_stocks, target_date, yearly)
-
-    # 基础筛选
+    annual_ok = {code: check_annual_trend(code, df_stocks, target_date, yearly) for code in valid_codes}
     latest = df_stocks.groupby(level='code').tail(1)
+    latest = latest[~latest.index.duplicated(keep='last')]
     base_codes = []
     for code in latest.index.get_level_values('code'):
         row = latest.loc[code]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
         if (annual_ok.get(code, False) and
                 row['amount_ma20'] >= MIN_20D_AMOUNT and
                 row['amount_ma120'] >= MIN_120D_AMOUNT):
             base_codes.append(code)
-    print(f"基础筛选后：{len(base_codes)} 只")
+    print(f"年线+流动性通过：{len(base_codes)} 只")
     if not base_codes:
-        return []
+        return [], [], []
 
-    # 技术信号
+    # ---------- 技术信号计算 ----------
     df_f = df_stocks[df_stocks.index.get_level_values('code').isin(base_codes)]
     daily_close = df_f['close'].unstack(level='code')
-    daily_low   = df_f['low'].unstack(level='code')
+    daily_low = df_f['low'].unstack(level='code')
 
-    # 周线
     w_close = daily_close.resample('W').last()
     w_low = daily_low.resample('W').min()
     w_df = pd.DataFrame({'close': w_close.stack(), 'low': w_low.stack()})
-    w_retest = detect_retest_with_gap(w_df, ma_period=20, tolerance_down=WEEKLY_RETEST_DOWN,
-                                      tolerance_near=WEEKLY_RETEST_NEAR, window=WEEKLY_RETEST_WINDOW,
-                                      min_gap=WEEKLY_RETEST_MIN_GAP, require_ma_up=True)
-    w_bb = detect_bb_expand(w_df, period=BB_PERIOD, std_mult=BB_STD_MULT, short_ma=BB_SHORT_MA,
-                            long_ma=BB_LONG_MA, overbought_limit=BB_OVERBOUGHT)
-    w_signal = w_retest | w_bb
 
-    # 月线
     m_close = daily_close.resample('ME').last()
     m_low = daily_low.resample('ME').min()
     m_df = pd.DataFrame({'close': m_close.stack(), 'low': m_low.stack()})
-    m_retest = detect_retest_with_gap(m_df, ma_period=20, tolerance_down=MONTHLY_RETEST_DOWN,
-                                      tolerance_near=MONTHLY_RETEST_NEAR, window=MONTHLY_RETEST_WINDOW,
-                                      min_gap=MONTHLY_RETEST_MIN_GAP, require_ma_up=True)
-    m_bb = detect_bb_expand(m_df, period=BB_PERIOD, std_mult=BB_STD_MULT, short_ma=BB_SHORT_MA,
-                            long_ma=BB_LONG_MA, overbought_limit=None)
-    m_signal = m_retest | m_bb
 
-    w_codes = w_signal.groupby(level='code').tail(1).pipe(lambda x: x[x].index.tolist())
-    m_codes = m_signal.groupby(level='code').tail(1).pipe(lambda x: x[x].index.tolist())
-    w_retest_codes = w_retest.groupby(level='code').tail(1).pipe(lambda x: x[x].index.tolist())
-    m_retest_codes = m_retest.groupby(level='code').tail(1).pipe(lambda x: x[x].index.tolist())
-    w_bb_codes = w_bb.groupby(level='code').tail(1).pipe(lambda x: x[x].index.tolist())
-    m_bb_codes = m_bb.groupby(level='code').tail(1).pipe(lambda x: x[x].index.tolist())
+    # 月线信号
+    m_retest = detect_retest_with_gap(m_df, 20, MONTHLY_RETEST_DOWN, MONTHLY_RETEST_NEAR,
+                                      MONTHLY_RETEST_WINDOW, MONTHLY_RETEST_MIN_GAP,
+                                      MONTHLY_RETEST_MIN_TOUCHES, True)
+    m_bb = detect_bb_expand(m_df, BB_PERIOD, BB_STD_MULT, BB_SHORT_MA, BB_LONG_MA,
+                            BB_MID_DIR_PERIOD, BB_SHORT_DIR_PERIOD, BB_MID_FLAT_OK)
 
-    def priority(code):
-        if code in w_retest_codes: return 1, '周线均线回踩'
-        if code in m_retest_codes: return 2, '月线均线回踩'
-        if code in w_bb_codes: return 3, '周线布林扩张'
-        if code in m_bb_codes: return 4, '月线布林扩张'
-        return 99, ''
+    # 周线信号（二次回踩）
+    w_retest = detect_retest_with_gap(w_df, 20, WEEKLY_RETEST_DOWN, WEEKLY_RETEST_NEAR,
+                                      WEEKLY_RETEST_WINDOW, WEEKLY_RETEST_MIN_GAP,
+                                      WEEKLY_RETEST_MIN_TOUCHES, True)
+    w_bb = detect_bb_expand(w_df, BB_PERIOD, BB_STD_MULT, BB_SHORT_MA, BB_LONG_MA,
+                            BB_MID_DIR_PERIOD, BB_SHORT_DIR_PERIOD, BB_MID_FLAT_OK)
 
-    # 财务筛选（放宽到 >0%）
+    def extract_codes(signal_series):
+        """从多级索引Series中提取唯一代码列表"""
+        return signal_series.groupby(level='code').tail(1).pipe(
+            lambda x: x[x].index.get_level_values('code').unique().tolist()
+        )
+
+    m_retest_codes = extract_codes(m_retest)
+    m_bb_codes = extract_codes(m_bb)
+    w_retest_codes = extract_codes(w_retest)
+    w_bb_codes = extract_codes(w_bb)
+
+    print(f"月线回踩: {len(m_retest_codes)} 只，月线布林扩张: {len(m_bb_codes)} 只")
+    print(f"周线回踩(二次): {len(w_retest_codes)} 只，周线布林扩张: {len(w_bb_codes)} 只")
+
+    # ---------- 财务筛选 ----------
     fin_before = df_fin[df_fin['effective_date'] <= target_date]
     if fin_before.empty:
-        return []
+        return [], [], []
     fin_latest = fin_before.sort_values('effective_date').groupby('code').tail(FIN_CONSEC)
-    # 要求扣非必须存在且>MIN_PNI_YOY(0)
     fin_pass = fin_latest.groupby('code').filter(
-        lambda x: (len(x) == FIN_CONSEC) and
-                  all(x['net_profit_yoy'] > MIN_PROFIT_YOY) and
+        lambda x: (len(x) == FIN_CONSEC) and all(x['net_profit_yoy'] > MIN_PROFIT_YOY) and
                   all(x['yoy_pni'].notna()) and all(x['yoy_pni'] > MIN_PNI_YOY)
     )
     fin_codes = fin_pass['code'].unique().tolist()
     print(f"财务符合：{len(fin_codes)} 只")
 
-    candidates = []
-    for code in set(w_codes + m_codes):
-        if code not in fin_codes:
-            continue
-        pri, desc = priority(code)
-        if pri == 99:
-            continue
-        candidates.append((code, pri, desc))
-    candidates.sort(key=lambda x: (x[1], x[0]))
-    final = candidates[:MAX_STOCKS]
-    return [(c, name_map.get(c, c), industry_map.get(c, ''), d) for c, _, d in final]
+    # ---------- 两层分类 ----------
+    # 第一层：全共振
+    core_set = set(base_codes) & set(m_retest_codes) & set(m_bb_codes) & set(w_retest_codes) & set(w_bb_codes) & set(fin_codes)
+
+    # 第二层硬条件池：年线 + (月线回踩 或 周线二次回踩) + 财务
+    hard_base = set(base_codes) & (set(m_retest_codes) | set(w_retest_codes)) & set(fin_codes)
+
+    tier1, tier2 = [], []
+    assigned = set()
+
+    # 第一层
+    for code in sorted(core_set):
+        assigned.add(code)
+        tier1.append((code, '全信号共振'))
+
+    # 第二层：已满足硬条件，检查软条件
+    for code in sorted(hard_base - assigned):
+        # 软条件
+        soft_a = code in m_bb_codes
+        soft_b = code in w_retest_codes
+        soft_c = soft_b and code in w_bb_codes
+        parts = []
+        if soft_a:
+            parts.append('月布林')
+        if soft_b:
+            parts.append('周二次回踩')
+        if soft_c:
+            parts.append('周布林')
+        if parts:
+            desc = '弹性降级：' + '+'.join(parts)
+            tier2.append((code, desc))
+
+    final_selected = tier1 + tier2
+    final = [(c, name_map.get(c, c), industry_map.get(c, ''), d) for c, d in final_selected[:MAX_STOCKS]]
+    print(f"第一层核心共振: {len(tier1)} 只，第二层弹性降级: {len(tier2)} 只，合计: {len(final)} 只")
+    return final, tier1, tier2
 
 
 # ===================== 回测引擎 =====================
 def run_backtest(conn, df_daily, df_fin, name_map, industry_map, start, end):
+    """执行周度调仓回测，返回绩效指标和净值序列"""
     close = df_daily['close'].unstack(level='code').loc[start:end].dropna(axis=1, how='all')
     bench = close[BENCH_CODE] if BENCH_CODE in close.columns else None
     stock_close = close[[c for c in close.columns if c != BENCH_CODE]]
@@ -318,7 +358,7 @@ def run_backtest(conn, df_daily, df_fin, name_map, industry_map, start, end):
 
     for d_raw in rebalance_dates:
         d = pd.Timestamp(d_raw)
-        sel = vectorized_select_stocks(conn, df_daily, df_fin, name_map, industry_map, target_date=d)
+        sel, _, _ = vectorized_select_stocks(conn, df_daily, df_fin, name_map, industry_map, target_date=d)
         targets = [s[0] for s in sel if s[0] in stock_close.columns]
 
         if last_date is not None:
@@ -364,6 +404,7 @@ def run_backtest(conn, df_daily, df_fin, name_map, industry_map, start, end):
 
 
 def calc_performance(nv, init, r=0.03):
+    """计算年化收益、夏普比率、最大回撤、卡玛比率、胜率等"""
     ret = nv.pct_change(fill_method=None).dropna()
     total = (nv.iloc[-1] / init - 1) * 100
     days = (nv.index[-1] - nv.index[0]).days
@@ -375,8 +416,7 @@ def calc_performance(nv, init, r=0.03):
     win = (ret > 0).sum() / len(ret) * 100 if len(ret) > 0 else 0
     return {
         'total_return': total, 'annual_return': annual, 'sharpe': sharpe,
-        'max_drawdown': maxdd, 'calmar': calmar, 'win_rate': win,
-        'final_value': nv.iloc[-1]
+        'max_drawdown': maxdd, 'calmar': calmar, 'win_rate': win, 'final_value': nv.iloc[-1]
     }
 
 
@@ -391,11 +431,10 @@ if __name__ == '__main__':
     industry_map = basic.set_index('code')['industry'].to_dict()
 
     print("\n===== 最新选股 =====")
-    selected = vectorized_select_stocks(conn, df_daily, df_fin, name_map, industry_map)
+    selected, tier1, tier2 = vectorized_select_stocks(conn, df_daily, df_fin, name_map, industry_map)
     if not selected:
         print("未选出股票")
     else:
-        # 计算参考指标
         df_f = df_daily[df_daily.index.get_level_values('code').isin([s[0] for s in selected])]
         close = df_f['close'].unstack(level='code')
         weekly_close = close.resample('W').last()
@@ -406,14 +445,15 @@ if __name__ == '__main__':
         w_mid = weekly_close.rolling(20).mean().iloc[-1]
         w_upper = w_mid + 2 * w_std
 
-        print("\n最终选股池（含参考线）：")
+        print("\n最终选股池（按层级排序）：")
         for c, n, ind, s in selected:
             print(f"{c} {n} [{ind}] {s}")
+
         with open('selected_stocks.txt', 'w') as f:
             for c, n, _, _ in selected:
                 f.write(f"{c.replace('sh.','').replace('sz.','')},{n}\n")
         with open('selected_stocks_detail.txt', 'w') as f:
-            f.write("代码,名称,行业,信号,20周线,20月线,布林上轨(周),止损参考(10%)\n")
+            f.write("代码,名称,行业,层级/信号,20周线,20月线,布林上轨(周),止损参考(10%)\n")
             for c, n, ind, s in selected:
                 plain = c.replace('sh.','').replace('sz.','')
                 w20v = w20.get(c, '') if w20 is not None else ''
