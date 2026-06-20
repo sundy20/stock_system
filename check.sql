@@ -20,3 +20,17 @@ SELECT COUNT(*) FROM (
                          SELECT code FROM financial WHERE net_profit_yoy > 0
                          GROUP BY code HAVING COUNT(*) >= 2
                      );
+
+
+-- 日线表：增加成交额、涨跌幅、换手率、前收盘价
+ALTER TABLE daily ADD COLUMN amount REAL DEFAULT 0;
+ALTER TABLE daily ADD COLUMN pct_chg REAL DEFAULT 0;
+ALTER TABLE daily ADD COLUMN turn REAL DEFAULT 0;
+ALTER TABLE daily ADD COLUMN pre_close REAL DEFAULT 0;
+
+-- 财务表：增加净资产增长率、总资产增长率、每股收益增长率、扣非净利润增长率
+ALTER TABLE financial ADD COLUMN yoy_equity REAL;
+ALTER TABLE financial ADD COLUMN yoy_asset REAL;
+ALTER TABLE financial ADD COLUMN yoy_eps REAL;
+ALTER TABLE financial ADD COLUMN yoy_pni REAL;
+EOF

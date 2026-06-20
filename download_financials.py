@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
 """
-baostock 财务数据下载：单季度净利润同比增长率
+baostock 财务数据下载——全字段，超时保护
 - 数据源为正式季报/年报，不含业绩预告
 - 支持并发下载、自动重试、临时表无冲突写入
-- 获取最近2年所有季度数据，发布后10天生效（消除未来函数）
-- 内置单任务超时与整体超时，防止个别股票阻塞所有线程
+- 获取最近2年所有季度数据，pub_date+10天生效（消除未来函数）
+- 保存字段：净利润增长率、营收增长率、净资产增长率、总资产增长率、EPS增长率、扣非净利润增长率
 """
 import baostock as bs
 import sqlite3
 import pandas as pd
 from datetime import datetime
-import time
-import sys
+import time, sys
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
+# ===================== 配置 =====================
 DB_PATH = 'stocks_2y.db'
-THREAD_NUM = 2              # 并发线程数
-REQUEST_DELAY = 0.2         # 单线程请求间隔（秒）
-MAX_RETRY = 2               # 最大重试次数
-SINGLE_TASK_TIMEOUT = 120   # 单只股票最大处理时间（秒），超时将跳过
-OVERALL_TIMEOUT = 600       # 整体最大等待时间（秒），通常 10 分钟足以；若全部线程卡死则强制终止
+THREAD_NUM = 2                # 并发线程数
+REQUEST_DELAY = 0.2           # 单线程请求间隔（秒）
+MAX_RETRY = 2                 # 最大重试次数
+SINGLE_TASK_TIMEOUT = 120     # 单只股票最大处理时间（秒）
+OVERALL_TIMEOUT = 600         # 整体最大等待时间（秒），防止全部线程死锁
 
 CURRENT_YEAR = datetime.now().year
-YEARS = [CURRENT_YEAR - 1, CURRENT_YEAR]
+YEARS = [CURRENT_YEAR - 1, CURRENT_YEAR]   # 查询最近两年
 QUARTERS = [1, 2, 3, 4]
 
 
 def init_worker():
-    """线程初始化：独立登录"""
+    """线程初始化：独立登录 baostock"""
     bs.login()
 
 
@@ -38,24 +38,29 @@ def get_mainboard_codes(conn):
 
 
 def init_db(conn):
-    """创建 financial 表，开启 WAL 模式"""
+    """创建 financial 表，开启 WAL 模式，包含所有扩展字段"""
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute('''CREATE TABLE IF NOT EXISTS financial (
                                                              code TEXT, name TEXT,
                                                              pub_date TEXT, stat_date TEXT,
                                                              net_profit_yoy REAL, revenue_yoy REAL,
+                                                             yoy_equity REAL, yoy_asset REAL, yoy_eps REAL, yoy_pni REAL,
                                                              PRIMARY KEY (code, stat_date)
         )''')
     conn.commit()
 
 
 def download_single_financial(args):
-    """下载单只股票的净利润同比增长率，返回 DataFrame 或 None"""
+    """
+    下载单只股票的净利润同比增长率及多项成长指标
+    返回 (DataFrame, 失败代码) 或 (None, 失败代码)
+    """
     code, name = args
     for retry in range(MAX_RETRY + 1):
         try:
             profit_data = {}
             pub_dates = {}
+            extra = {}       # 存储其他成长指标
             for year in YEARS:
                 for quarter in QUARTERS:
                     rs = bs.query_growth_data(code, year=year, quarter=quarter)
@@ -66,33 +71,51 @@ def download_single_financial(args):
                         rows.append(rs.get_row_data())
                     if not rows:
                         continue
-                    fields = rs.fields
-                    df = pd.DataFrame(rows, columns=fields)
-                    # 动态识别净利润增长率字段（通常为 YOYNI）
-                    profit_col = next((col for col in fields if col.lower() == 'yoyni'), None)
-                    if not profit_col:
-                        continue
-                    pub_date_col = next((col for col in fields if 'pubdate' in col.lower()), None)
-                    stat_date_col = next((col for col in fields if 'statdate' in col.lower()), None)
-                    df[profit_col] = pd.to_numeric(df[profit_col], errors='coerce')
+                    # 字段名统一转为小写方便映射
+                    fields = [f.lower() for f in rs.fields]
+                    df = pd.DataFrame(rows, columns=rs.fields)
+                    # 列名映射（原始字段 → 目标字段）
+                    col_map = {
+                        'yoyni': 'net_profit_yoy',
+                        'yoyequity': 'yoy_equity',
+                        'yoyasset': 'yoy_asset',
+                        'yoyepsbasic': 'yoy_eps',
+                        'yoypni': 'yoy_pni'
+                    }
+                    for orig, target in col_map.items():
+                        if orig in fields:
+                            df[target] = pd.to_numeric(df[rs.fields[fields.index(orig)]], errors='coerce')
+                    pub_date_col = next((f for f in rs.fields if 'pubdate' in f.lower()), None)
+                    stat_date_col = next((f for f in rs.fields if 'statdate' in f.lower()), None)
                     for _, row in df.iterrows():
-                        if pd.notna(row[profit_col]):
+                        if pd.notna(row.get('net_profit_yoy')):
                             sd = str(pd.to_datetime(row[stat_date_col]).date())
-                            profit_data[sd] = row[profit_col]
+                            profit_data[sd] = row['net_profit_yoy']
                             if pub_date_col:
                                 pub_dates[sd] = str(pd.to_datetime(row[pub_date_col]).date())
+                            extra[sd] = {
+                                'yoy_equity': row.get('yoy_equity'),
+                                'yoy_asset': row.get('yoy_asset'),
+                                'yoy_eps': row.get('yoy_eps'),
+                                'yoy_pni': row.get('yoy_pni')
+                            }
             time.sleep(REQUEST_DELAY)
             if not profit_data:
                 return None, code
 
             records = []
             for stat_date, net_yoy in profit_data.items():
+                ex = extra.get(stat_date, {})
                 records.append({
                     'code': code, 'name': name,
                     'pub_date': pub_dates.get(stat_date, ''),
                     'stat_date': stat_date,
                     'net_profit_yoy': net_yoy,
-                    'revenue_yoy': None
+                    'revenue_yoy': None,   # baostock 成长数据不含营收增长率，预留
+                    'yoy_equity': ex.get('yoy_equity'),
+                    'yoy_asset': ex.get('yoy_asset'),
+                    'yoy_eps': ex.get('yoy_eps'),
+                    'yoy_pni': ex.get('yoy_pni')
                 })
             return pd.DataFrame(records), None
         except Exception:
@@ -108,8 +131,12 @@ def batch_write_safe(conn, df_list):
     all_df = pd.concat(df_list, ignore_index=True)
     all_df.to_sql('financial_temp', conn, if_exists='replace', index=False, method='multi')
     conn.execute('''
-        INSERT OR REPLACE INTO financial (code, name, pub_date, stat_date, net_profit_yoy, revenue_yoy)
-        SELECT code, name, pub_date, stat_date, net_profit_yoy, revenue_yoy FROM financial_temp
+        INSERT OR REPLACE INTO financial (code, name, pub_date, stat_date,
+                                          net_profit_yoy, revenue_yoy,
+                                          yoy_equity, yoy_asset, yoy_eps, yoy_pni)
+        SELECT code, name, pub_date, stat_date,
+               net_profit_yoy, revenue_yoy,
+               yoy_equity, yoy_asset, yoy_eps, yoy_pni FROM financial_temp
     ''')
     conn.execute("DROP TABLE IF EXISTS financial_temp")
     conn.commit()
@@ -124,7 +151,7 @@ if __name__ == '__main__':
     codes = get_mainboard_codes(conn)
     total = len(codes)
     print(f"下载财务数据，共 {total} 只股票，{THREAD_NUM} 线程并发，全季度数据")
-    bs.logout()
+    bs.logout()   # 主线程登出，子线程各自登录
 
     success = 0
     failed = []
@@ -132,8 +159,8 @@ if __name__ == '__main__':
     BATCH_SIZE = 50
 
     with ThreadPoolExecutor(max_workers=THREAD_NUM, initializer=init_worker) as executor:
+        # 保存 future -> (code, name) 映射，用于超时信息输出
         future_to_code = {executor.submit(download_single_financial, task): task for task in codes}
-
         try:
             for i, future in enumerate(as_completed(future_to_code, timeout=OVERALL_TIMEOUT)):
                 code, name = future_to_code[future]
@@ -159,7 +186,6 @@ if __name__ == '__main__':
 
         except FuturesTimeoutError:
             print(f"\n⚠ 整体超时（{OVERALL_TIMEOUT}秒），剩余任务将被跳过。")
-            # 收集未完成的任务
             for future in future_to_code:
                 if not future.done():
                     code, name = future_to_code[future]
