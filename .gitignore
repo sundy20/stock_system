@@ -8,3 +8,4 @@ stocks_2y.db
 !/venv/
 !/selected_stocks_detail.txt
 /selected_stocks_detail.txt
+/failed_daily.txt
