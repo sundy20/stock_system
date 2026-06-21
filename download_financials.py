@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-baostock 财务数据下载——最终稳定版（主线程直接执行，彻底避免线程阻塞）
+baostock 财务数据下载——最终稳定版（主线程直接执行，彻底避免卡死）
 - 默认增量模式：仅补充缺失的季度数据（最近两年）
 - 全量模式：python3 download_financials.py --full  强制全量重新下载
-- 单线程直接执行，请求间隔 0.2~1.0 秒随机，避免高频被封
+- 单线程直接顺序执行，请求间隔 0.2~1.0 秒随机，避免高频被封
 - 断网重连等待 10~20 秒
 - 保存字段：成长能力 + 盈利能力 + 业绩快报
 - 失败股票输出到 failed_financial.txt，附带具体错误码和错误信息
@@ -21,6 +21,16 @@ MAX_RETRY = 2                 # 最大重试次数
 SOCKET_TIMEOUT = 180          # 底层 Socket 超时（秒）
 CURRENT_YEAR = datetime.now().year
 QUARTERS = [1, 2, 3, 4]      # 四个季度
+
+# 定义所有需要写入的列，确保临时表包含这些列
+ALL_COLUMNS = [
+    'code', 'name', 'pub_date', 'stat_date',
+    'net_profit_yoy', 'revenue_yoy',
+    'yoy_equity', 'yoy_asset', 'yoy_eps', 'yoy_pni',
+    'net_profit', 'roe_avg', 'gp_margin',
+    'express_gryoy', 'express_opyoy',
+    'express_pub_date', 'express_stat_date'
+]
 
 
 def reconnect_baostock():
@@ -84,6 +94,7 @@ def get_missing_quarters(conn, code):
                 sd = f"{year}-09-30"
             else:
                 sd = f"{year}-12-31"
+            # ★ 跳过未来季度（财报不可能已发布）
             if pd.Timestamp(sd) > pd.Timestamp.now():
                 continue
             if sd not in existing:
@@ -181,8 +192,10 @@ def download_single(code, name, year, quarter):
             except:
                 pass
 
+            # ★ 构造完整记录，显式包含所有列，缺失的用 None
             record = {
-                'code': code, 'name': name,
+                'code': code,
+                'name': name,
                 'pub_date': growth_data.get('pub_date', ''),
                 'stat_date': growth_data.get('stat_date', f"{year}-{quarter*3:02d}-31"),
                 'net_profit_yoy': growth_data.get('net_profit_yoy'),
@@ -191,8 +204,13 @@ def download_single(code, name, year, quarter):
                 'yoy_asset': growth_data.get('yoy_asset'),
                 'yoy_eps': growth_data.get('yoy_eps'),
                 'yoy_pni': growth_data.get('yoy_pni'),
-                **profit_data,
-                **express_data
+                'net_profit': profit_data.get('net_profit'),
+                'roe_avg': profit_data.get('roe_avg'),
+                'gp_margin': profit_data.get('gp_margin'),
+                'express_gryoy': express_data.get('express_gryoy'),
+                'express_opyoy': express_data.get('express_opyoy'),
+                'express_pub_date': express_data.get('express_pub_date', ''),
+                'express_stat_date': express_data.get('express_stat_date', '')
             }
             return pd.DataFrame([record]), None
 
@@ -209,21 +227,34 @@ def batch_write_safe(conn, df_list):
     """临时表 + INSERT OR REPLACE 批量写入"""
     if not df_list:
         return
+    # 拼接所有 DataFrame
     all_df = pd.concat(df_list, ignore_index=True)
-    all_df.to_sql('financial_temp', conn, if_exists='replace', index=False, method='multi')
+    # ★ 确保所有列都存在，缺失的填充 None
+    for col in ALL_COLUMNS:
+        if col not in all_df.columns:
+            all_df[col] = None
+    # 只保留需要的列并按顺序排列
+    all_df = all_df[ALL_COLUMNS]
+    # 写入临时表
+    all_df.to_sql('financial_temp', conn, if_exists='replace', index=False)
+    # 执行 INSERT OR REPLACE
     conn.execute('''
-        INSERT OR REPLACE INTO financial (code, name, pub_date, stat_date,
-                                          net_profit_yoy, revenue_yoy,
-                                          yoy_equity, yoy_asset, yoy_eps, yoy_pni,
-                                          net_profit, roe_avg, gp_margin,
-                                          express_gryoy, express_opyoy,
-                                          express_pub_date, express_stat_date)
-        SELECT code, name, pub_date, stat_date,
-               net_profit_yoy, revenue_yoy,
-               yoy_equity, yoy_asset, yoy_eps, yoy_pni,
-               net_profit, roe_avg, gp_margin,
-               express_gryoy, express_opyoy,
-               express_pub_date, express_stat_date FROM financial_temp
+        INSERT OR REPLACE INTO financial (
+            code, name, pub_date, stat_date,
+            net_profit_yoy, revenue_yoy,
+            yoy_equity, yoy_asset, yoy_eps, yoy_pni,
+            net_profit, roe_avg, gp_margin,
+            express_gryoy, express_opyoy,
+            express_pub_date, express_stat_date
+        )
+        SELECT
+            code, name, pub_date, stat_date,
+            net_profit_yoy, revenue_yoy,
+            yoy_equity, yoy_asset, yoy_eps, yoy_pni,
+            net_profit, roe_avg, gp_margin,
+            express_gryoy, express_opyoy,
+            express_pub_date, express_stat_date
+        FROM financial_temp
     ''')
     conn.execute("DROP TABLE IF EXISTS financial_temp")
     conn.commit()
@@ -281,7 +312,7 @@ if __name__ == '__main__':
     print(f"主线程直接执行，请求间隔 {REQUEST_MIN_DELAY}~{REQUEST_MAX_DELAY} 秒")
     print(f"预计耗时 {len(tasks) * (REQUEST_MIN_DELAY + REQUEST_MAX_DELAY) / 2 / 60:.1f} 分钟")
 
-    # 开始顺序处理
+    # 主循环顺序处理
     success = 0
     failed_stocks = {}
     batch_buffer = []
