@@ -70,15 +70,27 @@ def get_stock_list_smart(conn):
             raise RuntimeError("本地缓存为空，请检查网络")
 
     # 过滤退市/长期停牌
+    # 核心逻辑：有数据但最近无交易 → 过滤；从未下载过（新股）→ 保留
     cutoff = (datetime.now() - timedelta(days=INACTIVE_DAYS)).strftime('%Y-%m-%d')
     last_dates = pd.read_sql("""
                              SELECT code, MAX(date) as last_date FROM daily
                              WHERE code IN (SELECT code FROM stock_basic) GROUP BY code
                              """, conn)
-    active = last_dates[last_dates['last_date'] >= cutoff]['code'].tolist()
+    active_with_data = set(last_dates[last_dates['last_date'] >= cutoff]['code'].tolist())
+    codes_with_data   = set(last_dates['code'].tolist())
+    codes_without_data = set(df['code'].tolist()) - codes_with_data
+
+    active = active_with_data | codes_without_data
     removed = df[~df['code'].isin(active)]
     if not removed.empty:
-        print(f"  ⚠ 过滤掉 {len(removed)} 只退市/停牌股: {removed['code'].tolist()}")
+        print(f"  ⚠ 过滤掉 {len(removed)} 只退市/停牌股（有数据但最新日>{INACTIVE_DAYS}天前）")
+        removed_list = removed['code'].tolist()
+        if len(removed_list) <= 20:
+            print(f"     {removed_list}")
+        else:
+            print(f"     {removed_list[:10]} ... 等共{len(removed_list)}只")
+    if codes_without_data:
+        print(f"  ℹ 保留 {len(codes_without_data)} 只无历史数据的新股（首次下载）")
     df = df[df['code'].isin(active)]
     print(f"  ✓ 最终活跃股票 {len(df)} 只")
     return df

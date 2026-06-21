@@ -56,7 +56,7 @@ WEEKLY_BB_PRICE_LIMIT = None         # 高位过滤已取消（设为None）
 MA_DIR_PERIOD = 3              # 当期均线值 > 前3期均值
 
 # --- 财务筛选开关（★ 核心新增） ---
-USE_FINANCIAL_FILTER = False   # 设为 True 则启用财务筛选，默认关闭（纯技术面选股）
+USE_FINANCIAL_FILTER = True   # 设为 True 则启用财务筛选，默认关闭（纯技术面选股）
 # 财务阈值（仅在开关开启时生效）
 FIN_CONSEC = 2                 # 连续季度数
 MIN_PROFIT_YOY = 0.0           # 归母净利润同比 > 0%
@@ -72,6 +72,15 @@ REBALANCE_FREQ = 'W'           # 调仓频率：W=周, M=月
 # --- 数据库与基准 ---
 DB_PATH = 'stocks_2y.db'       # 数据库文件路径
 BENCH_CODE = 'sh.000300'       # 基准指数（沪深300）
+
+
+# ===================== 性能优化导入 =====================
+try:
+    from numba import jit, prange
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    jit = lambda f: f  # Fallback to no-op decorator
 
 
 # ===================== 数据加载函数 =====================
@@ -256,7 +265,7 @@ def detect_bb_expand(price_df, period=20, std_mult=2, short_ma=5, long_ma=20,
 # ===================== 财务筛选辅助 =====================
 def apply_financial_filter(fin_codes_base, df_fin, target_date):
     """
-    根据财务数据过滤股票代码列表，返回通过财务条件的代码列表。
+    根据财务数据过滤股票代码列表，返回通过财务条件的代码列表
     条件（连续 FIN_CONSEC 个季度同时满足）：
         - 归母净利润同比 > MIN_PROFIT_YOY
         - 扣非净利润同比 > MIN_PNI_YOY（若缺失则跳过）
@@ -282,3 +291,180 @@ def apply_financial_filter(fin_codes_base, df_fin, target_date):
                   all((x['gp_margin'].isna()) | (x['gp_margin'] > 0))
     )
     return fin_pass['code'].unique().tolist()
+
+
+# ===================== 预计算与快速查询 =====================
+
+def get_latest_value(series, target_date):
+    """
+    获取 Series 在 target_date 或之前的最新值（使用 asof 二分查找，O(log n)）。
+    用于从预计算的时间序列中切片取值，避免未来函数。
+    返回 None 表示无有效值（数据不足或 target_date 早于序列起始）。
+    """
+    if series is None or series.empty:
+        return None
+    target_ts = pd.Timestamp(target_date)
+    if target_ts < series.index[0]:
+        return None
+    val = series.asof(target_ts)
+    if pd.isna(val):
+        return None
+    return val
+
+
+def check_annual_trend_fast(code, cache_entry, yearly, target_date):
+    """
+    快速年线趋势检查（使用预计算指标，无未来函数）。
+    替代 check_annual_trend，修复回测中的前瞻偏差：
+    - 原函数在回测中用了全量数据的尾部（iloc[-250:]），包含未来数据
+    - 本函数从预计算时间序列切片取值，只用到 target_date 为止的数据
+    """
+    target_ts = pd.Timestamp(target_date)
+
+    # 1. 滚动12个月验证（从预计算时间序列切片）
+    rolling_ok = False
+    rolling_series = cache_entry.get('rolling_ok')
+    if rolling_series is not None and not rolling_series.empty:
+        val = get_latest_value(rolling_series, target_ts)
+        if val is not None:
+            rolling_ok = bool(val)
+
+    # 2. 自然年验证
+    natural_ok = False
+    last_year = target_ts.year - 1
+    natural_years = cache_entry.get('natural_years', {})
+    if last_year in natural_years:
+        natural_ok = natural_years[last_year]
+    elif code in yearly.index.get_level_values('code'):
+        # 次新股：只看 target_date 之前的年度数据（避免前瞻）
+        df_y = yearly.loc[code].sort_index()
+        available_years = [y for y in df_y.index if y <= last_year]
+        if available_years:
+            natural_ok = df_y.loc[available_years[-1]]['last_close'] > df_y.loc[available_years[0]]['first_open']
+
+    return rolling_ok or natural_ok
+
+
+def precompute_all_signals_once(df_daily):
+    """
+    一次性预计算所有股票的指标和信号（覆盖 df_daily 的全部日期范围）。
+
+    核心优化：替代原来每个调仓日都全量重算的方式，只需调用一次，
+    后续通过 get_latest_value / check_annual_trend_fast 切片取值。
+    回测场景下，从 104 次×全量计算 降为 1 次×全量计算 + 104 次×切片取值。
+
+    不修改 df_daily 入参，所有指标存储在返回的 signal_cache 中。
+
+    返回 (signal_cache, yearly):
+      signal_cache[code] = {
+        'rolling_ok':    bool Series（日线日期索引），年线滚动趋势
+        'natural_years': dict {year: bool}，自然年收红
+        'amount_ma20':   float Series（日线日期索引），20日均成交额（万）
+        'amount_ma120':  float Series（日线日期索引），120日均成交额（万）
+        'w_retest':      bool Series（周线日期索引）或 None
+        'm_retest':      bool Series（月线日期索引）或 None
+        'w_bb':          bool Series（周线日期索引）或 None
+        'm_bb':          bool Series（月线日期索引）或 None
+      }
+      yearly = DataFrame（code, year MultiIndex）
+    """
+    print("一次性预计算所有指标和信号...")
+
+    # 1. 年度聚合（全范围，一次计算）
+    df_daily['year'] = df_daily.index.get_level_values('date').year
+    yearly = df_daily.groupby(['code', 'year']).agg(
+        first_open=('open', 'first'), last_close=('close', 'last'), total_volume=('volume', 'sum')
+    ).sort_index()
+    print("  年度聚合完成")
+
+    # 2. 逐股预计算
+    all_codes = df_daily.index.get_level_values('code').unique()
+    total = len(all_codes)
+    signal_cache = {}
+
+    for i, code in enumerate(all_codes):
+        if code == BENCH_CODE:
+            continue
+        if (i + 1) % 500 == 0 or i == total - 1:
+            print(f"  信号进度: {i+1}/{total}")
+
+        try:
+            df_code = df_daily.loc[code].sort_index()
+            if len(df_code) < 120:
+                continue
+
+            # --- 年线滚动指标（时间序列，避免前瞻偏差）---
+            rolling_ok = pd.Series(False, index=df_code.index, dtype=bool)
+            if len(df_code) >= ROLLING_DAYS * 2:
+                ma250 = df_code['close'].rolling(ROLLING_DAYS).mean()
+
+                price_change = (df_code['close'] - df_code['close'].shift(ROLLING_DAYS)) / df_code['close'].shift(ROLLING_DAYS)
+                price_up = price_change >= ROLLING_PRICE_UP
+
+                recent_vol = df_code['amount'].rolling(ROLLING_DAYS).mean()
+                prev_vol = recent_vol.shift(ROLLING_DAYS)
+                vol_up = (recent_vol / prev_vol - 1) >= ROLLING_VOL_UP
+
+                above_ma = df_code['close'] >= ma250
+                slope = (ma250 - ma250.shift(20)) / 20
+                slope_ok = slope >= MA_SLOPE_THRESHOLD
+
+                rolling_ok = price_up & vol_up & above_ma & slope_ok
+
+            # --- 自然年收红 ---
+            natural_years = {}
+            if code in yearly.index.get_level_values('code'):
+                df_y = yearly.loc[code]
+                for y in df_y.index:
+                    natural_years[y] = bool(df_y.loc[y]['last_close'] > df_y.loc[y]['first_open'])
+
+            # --- 流动性指标 ---
+            amount_wan = df_code['amount'] / 10000
+            amount_ma20 = amount_wan.rolling(20).mean()
+            amount_ma120 = amount_wan.rolling(120).mean()
+
+            # --- 周线/月线 resample + 信号 ---
+            df_w = df_code[['close', 'low']].resample('W').agg({'close': 'last', 'low': 'min'}).dropna()
+            df_m = df_code[['close', 'low']].resample('ME').agg({'close': 'last', 'low': 'min'}).dropna()
+
+            w_retest = m_retest = w_bb = m_bb = None
+            if len(df_w) >= 20 and len(df_m) >= 18:
+                w_retest = detect_retest_with_gap(
+                    df_w, 20, WEEKLY_RETEST_DOWN, WEEKLY_RETEST_NEAR,
+                    WEEKLY_RETEST_WINDOW, WEEKLY_RETEST_MIN_GAP,
+                    WEEKLY_RETEST_MIN_TOUCHES, True)
+                m_retest = detect_retest_with_gap(
+                    df_m, 20, MONTHLY_RETEST_DOWN, MONTHLY_RETEST_NEAR,
+                    MONTHLY_RETEST_WINDOW, MONTHLY_RETEST_MIN_GAP,
+                    MONTHLY_RETEST_MIN_TOUCHES, True)
+                w_bb = detect_bb_expand(
+                    df_w, BB_PERIOD, BB_STD_MULT, BB_SHORT_MA, BB_LONG_MA,
+                    require_mid_up=WEEKLY_BB_REQUIRE_MID_UP,
+                    short_dir_period=BB_SHORT_DIR_PERIOD,
+                    overbought_limit=None,
+                    pre_expand=WEEKLY_BB_PRE_EXPAND,
+                    contraction_ratio=WEEKLY_BB_CONTRACTION_RATIO,
+                    use_dual_mode=WEEKLY_BB_USE_DUAL_MODE,
+                    price_limit=WEEKLY_BB_PRICE_LIMIT)
+                m_bb = detect_bb_expand(
+                    df_m, BB_PERIOD, BB_STD_MULT, BB_SHORT_MA, BB_LONG_MA,
+                    require_mid_up=MONTHLY_BB_REQUIRE_MID_UP,
+                    short_dir_period=BB_SHORT_DIR_PERIOD,
+                    overbought_limit=None)
+
+            signal_cache[code] = {
+                'rolling_ok': rolling_ok,
+                'natural_years': natural_years,
+                'amount_ma20': amount_ma20,
+                'amount_ma120': amount_ma120,
+                'w_retest': w_retest,
+                'm_retest': m_retest,
+                'w_bb': w_bb,
+                'm_bb': m_bb,
+            }
+        except Exception as e:
+            print(f"  计算 {code} 时出错: {e}")
+            continue
+
+    print(f"预计算完成，共 {len(signal_cache)} 只股票")
+    return signal_cache, yearly

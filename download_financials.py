@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-baostock 财务数据下载——最终优化版（智能季度、缩短延迟、失败不重试）
+baostock 财务数据下载——优化版（express缓存 + 批量SQL + 固定延迟）
 - 默认增量模式：仅补充缺失的季度数据（最近两年）
 - 全量模式：python3 download_financials.py --full  强制全量重新下载
-- 单线程顺序执行，请求间隔 0.1~0.5 秒随机，高效且安全
-- 智能跳过未到季报截止日的季度，避免无效请求
+- 单线程顺序执行，请求间隔固定 0.1 秒
+- express report 按 (code, year) 缓存，同一年份多个季度共享，省 75% express 调用
+- 缺失季度批量 SQL 查询，一次取全部股票的既有数据
 - 仅对网络错误进行重试，确定性失败直接跳过
 - 断网重连等待 10~20 秒
 - 保存字段：成长能力 + 盈利能力 + 业绩快报
@@ -20,9 +21,8 @@ import time, sys, socket, random
 warnings.filterwarnings('ignore', category=FutureWarning)
 
 DB_PATH = 'stocks_2y.db'
-REQUEST_MIN_DELAY = 0.1       # 最小请求间隔（秒），缩短以提高效率
-REQUEST_MAX_DELAY = 0.5       # 最大请求间隔（秒），缩短以提高效率
-MAX_RETRY = 1                 # 网络错误重试次数（仅网络问题）
+REQUEST_DELAY = 0.1             # 固定请求间隔（秒），baostock 无公开限速，0.1s 安全
+MAX_RETRY = 1                   # 网络错误重试次数（仅网络问题）
 SOCKET_TIMEOUT = 180
 CURRENT_YEAR = datetime.now().year
 QUARTERS = [1, 2, 3, 4]
@@ -94,40 +94,20 @@ def is_quarter_available(year, quarter):
     return pd.Timestamp.now() >= deadline
 
 
-def get_missing_quarters(conn, code):
-    """返回该股票最近两年缺失的季度列表，同时考虑季报是否可查"""
-    existing = set()
-    rows = conn.execute("""
-                        SELECT stat_date FROM financial
-                        WHERE code=? AND stat_date >= ? AND net_profit_yoy IS NOT NULL
-                        """, (code, f"{CURRENT_YEAR-2}-01-01")).fetchall()
-    for (sd,) in rows:
-        existing.add(sd)
-
-    missing = []
-    for year in [CURRENT_YEAR - 1, CURRENT_YEAR]:
-        for quarter in QUARTERS:
-            if not is_quarter_available(year, quarter):
-                continue
-            if quarter == 1:
-                sd = f"{year}-03-31"
-            elif quarter == 2:
-                sd = f"{year}-06-30"
-            elif quarter == 3:
-                sd = f"{year}-09-30"
-            else:
-                sd = f"{year}-12-31"
-            if sd not in existing:
-                missing.append((year, quarter, sd))
-    return missing
+def _quarter_stat_date(year, quarter):
+    """将 (年, 季度) 映射为 stat_date 字符串，如 (2025,1) → '2025-03-31'"""
+    month = quarter * 3
+    day = 30 if month in (6, 9) else 31
+    return f"{year}-{month:02d}-{day}"
 
 
-def download_single(code, name, year, quarter):
+def download_single(code, name, year, quarter, express_cache):
     """
     下载单只股票指定季度的财务数据。
     网络错误会重试，其他错误直接返回。
+    express_cache: {(code, year): DataFrame}，缓存 express report 查询结果
     """
-    time.sleep(random.uniform(REQUEST_MIN_DELAY, REQUEST_MAX_DELAY))
+    time.sleep(REQUEST_DELAY)
 
     for retry in range(MAX_RETRY + 1):
         try:
@@ -162,7 +142,6 @@ def download_single(code, name, year, quarter):
                         growth_data['pub_date'] = str(pd.to_datetime(df[pub_date_col].iloc[0]).date()) if pub_date_col else ''
                         growth_data['stat_date'] = sd
             else:
-                # 非网络错误，直接失败
                 return None, f"成长能力接口错误: error_code={rs.error_code}, msg={rs.error_msg}"
 
             if not growth_data:
@@ -187,32 +166,43 @@ def download_single(code, name, year, quarter):
             except:
                 pass
 
-            # 3. 业绩快报（可选）
-            try:
-                rs_express = bs.query_performance_express_report(code, start_date=f"{year}-01-01", end_date=f"{year+1}-12-31")
-                if rs_express.error_code == '0':
-                    rows = []
-                    while rs_express.next():
-                        rows.append(rs_express.get_row_data())
-                    if rows:
-                        df = pd.DataFrame(rows, columns=rs_express.fields)
-                        target_end = f"{year}-{quarter*3:02d}-31" if quarter < 4 else f"{year}-12-31"
-                        mask = df['performanceExpStatDate'] == target_end
-                        if mask.any():
-                            latest = df[mask].iloc[-1]
-                            if 'performanceExpressGRYOY' in rs_express.fields:
-                                express_data['express_gryoy'] = pd.to_numeric(latest['performanceExpressGRYOY'], errors='coerce')
-                            if 'performanceExpressOPYOY' in rs_express.fields:
-                                express_data['express_opyoy'] = pd.to_numeric(latest['performanceExpressOPYOY'], errors='coerce')
-                            express_data['express_pub_date'] = latest.get('performanceExpPubDate', '')
-                            express_data['express_stat_date'] = latest.get('performanceExpStatDate', '')
-            except:
-                pass
+            # 3. 业绩快报（缓存优化：同 (code, year) 只查一次）
+            cache_key = (code, year)
+            if cache_key in express_cache:
+                express_df = express_cache[cache_key]
+            else:
+                express_df = None
+                try:
+                    rs_express = bs.query_performance_express_report(
+                        code, start_date=f"{year}-01-01", end_date=f"{year+1}-12-31")
+                    if rs_express.error_code == '0':
+                        rows = []
+                        while rs_express.next():
+                            rows.append(rs_express.get_row_data())
+                        if rows:
+                            express_df = pd.DataFrame(rows, columns=rs_express.fields)
+                except:
+                    pass
+                express_cache[cache_key] = express_df   # None 也缓存，避免重复失败调用
+
+            if express_df is not None and not express_df.empty:
+                target_end = _quarter_stat_date(year, quarter)
+                mask = express_df['performanceExpStatDate'] == target_end
+                if mask.any():
+                    latest = express_df[mask].iloc[-1]
+                    if 'performanceExpressGRYOY' in express_df.columns:
+                        express_data['express_gryoy'] = pd.to_numeric(
+                            latest['performanceExpressGRYOY'], errors='coerce')
+                    if 'performanceExpressOPYOY' in express_df.columns:
+                        express_data['express_opyoy'] = pd.to_numeric(
+                            latest['performanceExpressOPYOY'], errors='coerce')
+                    express_data['express_pub_date'] = latest.get('performanceExpPubDate', '')
+                    express_data['express_stat_date'] = latest.get('performanceExpStatDate', '')
 
             record = {
                 'code': code, 'name': name,
                 'pub_date': growth_data.get('pub_date', ''),
-                'stat_date': growth_data.get('stat_date', f"{year}-{quarter*3:02d}-31"),
+                'stat_date': growth_data.get('stat_date', _quarter_stat_date(year, quarter)),
                 'net_profit_yoy': growth_data.get('net_profit_yoy'),
                 'revenue_yoy': None,
                 'yoy_equity': growth_data.get('yoy_equity'),
@@ -287,20 +277,40 @@ if __name__ == '__main__':
     codes = get_mainboard_codes(conn)
     total = len(codes)
 
+    # === 任务构建 ===
     tasks = []
     skipped = 0
-    for code, name in codes:
-        if full_mode:
+
+    if full_mode:
+        for code, name in codes:
             for y in [CURRENT_YEAR - 1, CURRENT_YEAR]:
                 for q in QUARTERS:
-                    if not is_quarter_available(y, q):
+                    if is_quarter_available(y, q):
+                        tasks.append((code, name, y, q))
+    else:
+        # 批量 SQL：一次查询全部股票的既有 stat_date
+        min_date = f"{CURRENT_YEAR-2}-01-01"
+        rows = conn.execute("""
+            SELECT code, stat_date FROM financial
+            WHERE stat_date >= ? AND net_profit_yoy IS NOT NULL
+        """, (min_date,)).fetchall()
+
+        existing_by_code = {}
+        for cd, sd in rows:
+            existing_by_code.setdefault(cd, set()).add(sd)
+
+        for code, name in codes:
+            existing = existing_by_code.get(code, set())
+            missing_count = 0
+            for year in (CURRENT_YEAR - 1, CURRENT_YEAR):
+                for quarter in QUARTERS:
+                    if not is_quarter_available(year, quarter):
                         continue
-                    tasks.append((code, name, y, q))
-        else:
-            missing = get_missing_quarters(conn, code)
-            for year, quarter, sd in missing:
-                tasks.append((code, name, year, quarter))
-            if not missing:
+                    sd = _quarter_stat_date(year, quarter)
+                    if sd not in existing:
+                        tasks.append((code, name, year, quarter))
+                        missing_count += 1
+            if missing_count == 0:
                 skipped += 1
 
     print(f"共 {total} 只股票，{len(tasks)} 个季度任务，已跳过 {skipped} 只完整股票")
@@ -310,16 +320,17 @@ if __name__ == '__main__':
         conn.close()
         sys.exit(0)
 
-    print(f"主线程直接执行，请求间隔 {REQUEST_MIN_DELAY}~{REQUEST_MAX_DELAY} 秒")
-    print(f"预计耗时 {len(tasks) * (REQUEST_MIN_DELAY + REQUEST_MAX_DELAY) / 2 / 60:.1f} 分钟")
+    print(f"请求间隔固定 {REQUEST_DELAY:.1f} 秒，express 按 (code, year) 缓存（同一年份只查1次）")
+    print(f"预计耗时 {len(tasks) * REQUEST_DELAY / 60:.1f} 分钟（不含 API 响应时间）")
 
     success = 0
     failed_stocks = {}
     batch_buffer = []
+    express_cache = {}         # {(code, year): DataFrame | None}
     start_time = time.time()
 
     for idx, (code, name, year, quarter) in enumerate(tasks):
-        df, err_msg = download_single(code, name, year, quarter)
+        df, err_msg = download_single(code, name, year, quarter, express_cache)
 
         if df is not None:
             batch_buffer.append(df)
@@ -334,7 +345,8 @@ if __name__ == '__main__':
 
         if (idx + 1) % 200 == 0:
             elapsed = time.time() - start_time
-            print(f"  已处理 {idx+1}/{len(tasks)}，已用时 {elapsed/60:.1f} 分钟")
+            print(f"  已处理 {idx+1}/{len(tasks)}，已用时 {elapsed/60:.1f} 分钟，"
+                  f"express缓存命中 {sum(1 for v in express_cache.values() if v is not None)} 次")
 
     if batch_buffer:
         batch_write_safe(conn, batch_buffer)
@@ -345,11 +357,11 @@ if __name__ == '__main__':
     if failed_stocks:
         print(f"失败股票 {len(failed_stocks)} 只，详情写入 failed_financial.txt")
         with open('failed_financial.txt', 'w') as f:
-            for code, reason in failed_stocks.items():
-                f.write(f"{code},{reason}\n")
+            for cd, reason in failed_stocks.items():
+                f.write(f"{cd},{reason}\n")
         print("前10条失败示例:")
-        for code, reason in list(failed_stocks.items())[:10]:
-            print(f"  {code}: {reason}")
+        for cd, reason in list(failed_stocks.items())[:10]:
+            print(f"  {cd}: {reason}")
 
     bs.logout()
     print("下载结束。")
