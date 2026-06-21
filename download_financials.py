@@ -3,7 +3,7 @@
 baostock 财务数据下载——智能增量更新，全字段，超时保护，断网重连
 - 默认增量模式：仅补充缺失的季度数据（最近两年，以net_profit_yoy是否存在为准）
 - 全量模式：python3 download_financials.py --full  强制全量重新下载
-- 单线程运行（THREAD_NUM=1），请求间隔 0.5~1.5 秒随机，避免高频被封
+- 单线程运行（THREAD_NUM=1），请求间隔 0.2~1.0 秒随机，避免高频被封
 - 保存字段：净利润同比、营收同比(留空)、净资产同比、总资产同比、EPS同比、扣非净利润同比
             + 盈利能力：net_profit(净利润)、roe_avg(净资产收益率)、gp_margin(销售毛利率)
             + 业绩快报：express_gryoy(营收同比)、express_opyoy(营业利润同比)
@@ -17,9 +17,9 @@ import time, sys, socket, random
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
 DB_PATH = 'stocks_2y.db'
-THREAD_NUM = 1                # 单线程，防止高频被封
-REQUEST_MIN_DELAY = 0.5       # 每次查询前最小随机等待（秒）
-REQUEST_MAX_DELAY = 1.5       # 最大随机等待（秒）
+THREAD_NUM = 1                # 单线程，符合官方要求，避免被封
+REQUEST_MIN_DELAY = 0.2       # 每次查询前最小随机等待（秒）
+REQUEST_MAX_DELAY = 1.0       # 最大随机等待（秒）
 MAX_RETRY = 2                 # 最大重试次数
 SINGLE_TASK_TIMEOUT = 180     # 单任务超时
 SOCKET_TIMEOUT = 180

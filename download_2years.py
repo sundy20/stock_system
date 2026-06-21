@@ -1,152 +1,307 @@
 #!/usr/bin/env python3
 """
-下载全部沪深主板非ST股票+沪深300指数日线数据（起始于2024-01-01）
-- 2线程并发，请求间隔0.2秒，重试2次
-- 全量覆盖，INSERT OR REPLACE 确保前复权数据最新
-- 失败自动补：中断后无需重试，下周运行时会自动补充
+baostock 日线数据下载（前复权）—— 单线程优化版（备选主力）
+- 默认增量模式：仅下载缺失数据（与数据库最新交易日的差距）
+- 全量模式：python3 download_2years.py --full  强制从2018年起全量重新下载
+- 自动过滤 ST / 退市 / 长期停牌（最新交易日距今>60天）股票
+- 保存字段：open,high,low,close,volume,amount(元),pct_chg(%),turn(%),pre_close
+- 单线程运行，每次请求前随机等待 0.2~1.0 秒，避免服务器压力
+- 使用临时表 + INSERT OR REPLACE 写入
+- 股票列表自动更新到 stock_basic 表（含行业、上市日期）
+- 失败股票输出到 failed_daily_bs.txt，附带具体异常信息
+- 内置断网重连机制，网络异常时自动恢复
 """
-import baostock as bs
-import sqlite3
-import pandas as pd
-from datetime import datetime
-import time
-import random
+import os, sys, time, sqlite3, pandas as pd, random, socket
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import baostock as bs
 
+# ===================== 配置 =====================
 DB_PATH = 'stocks_2y.db'
-THREAD_NUM = 2                     # 线程数
-REQUEST_DELAY = 0.2                # 请求间隔（秒）
-MAX_RETRY = 2                      # 最大重试次数
-BENCH_CODE = 'sh.000300'           # 沪深300基准代码
+FULL_START_DATE = '2018-01-01'        # 全量下载的起始日期
+THREAD_NUM = 1                        # 单线程，与财务下载保持一致
+REQUEST_MIN_DELAY = 0.2               # 每次请求前最小随机等待（秒）
+REQUEST_MAX_DELAY = 1.0               # 最大随机等待（秒）
+INACTIVE_DAYS = 60                    # 退市判定：最新交易日距今超过此天数即过滤
+MAX_RETRY = 2                         # 单只股票最大重试次数
+SOCKET_TIMEOUT = 60                   # 底层Socket超时（秒）
 
-START_DATE = '2024-01-01'
-END_DATE = datetime.now().strftime('%Y-%m-%d')
+
+def reconnect_baostock():
+    """断网重连：登出并重新登录baostock，恢复Socket超时"""
+    try:
+        bs.logout()
+    except:
+        pass
+    wait = random.uniform(2, 5)
+    print(f"  ⚠ 网络异常，{wait:.1f}秒后重连...", file=sys.stderr)
+    time.sleep(wait)
+    lg = bs.login()
+    if lg.error_code != '0':
+        raise RuntimeError(f"重连失败: {lg.error_msg}")
+    socket.setdefaulttimeout(SOCKET_TIMEOUT)
+
 
 def init_worker():
-    """线程初始化：独立登录"""
-    bs.login()
+    """线程初始化：设置Socket超时并独立登录baostock"""
+    socket.setdefaulttimeout(SOCKET_TIMEOUT)
+    lg = bs.login()
+    if lg.error_code != '0':
+        raise RuntimeError(f"线程登录失败: {lg.error_msg}")
 
-def get_mainboard_codes():
-    """获取沪深主板非ST股票列表，并加入沪深300指数"""
-    rs = bs.query_stock_basic(code_name="")
-    stocks = []
-    while rs.next():
-        stocks.append(rs.get_row_data())
-    df = pd.DataFrame(stocks, columns=rs.fields)
-    mask = (df['type'] == '1') & \
-           (df['code'].str.match(r'^(sh\.60|sz\.00)')) & \
-           (~df['code_name'].str.contains('ST'))
-    code_list = list(zip(df[mask]['code'], df[mask]['code_name']))
-    code_list.append((BENCH_CODE, '沪深300'))
-    return code_list
 
 def init_db(conn):
-    """初始化数据库，开启WAL模式及索引"""
+    """初始化数据库表结构（若不存在则创建）"""
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA cache_size = -20000;")
     conn.execute('''CREATE TABLE IF NOT EXISTS daily (
                                                          code TEXT, date TEXT, name TEXT,
-                                                         open REAL, high REAL, low REAL,
-                                                         close REAL, volume REAL,
+                                                         open REAL, high REAL, low REAL, close REAL,
+                                                         volume REAL, amount REAL, pct_chg REAL, turn REAL, pre_close REAL,
                                                          PRIMARY KEY (code, date))''')
     conn.execute('''CREATE TABLE IF NOT EXISTS stock_basic (
-                                                               code TEXT PRIMARY KEY,
-                                                               name TEXT
-                    )''')
+                                                               code TEXT PRIMARY KEY, name TEXT, industry TEXT, list_date TEXT)''')
     conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_code_date ON daily(code, date);")
     conn.commit()
 
-def download_single_stock(args):
-    """下载单只股票日线，带重试机制"""
-    code, name = args
+
+def get_stock_list_baostock(conn):
+    """
+    从baostock获取最新股票列表（含行业、上市日期），并过滤ST/退市/长期停牌
+    返回 DataFrame（code, name, industry, list_date）
+    """
+    print("  从baostock获取股票列表...")
+    rs = bs.query_stock_basic()
+    if rs.error_code != '0':
+        print(f"  ⚠ 获取股票列表失败: {rs.error_msg}")
+        df = pd.read_sql("SELECT code, name, industry, list_date FROM stock_basic", conn)
+        if df.empty:
+            raise RuntimeError("本地缓存为空，且无法获取列表，请检查网络")
+        return df
+
+    data = []
+    while rs.next():
+        data.append(rs.get_row_data())
+    df_all = pd.DataFrame(data, columns=rs.fields)
+    # 筛选沪深主板（sh.60xxxx, sz.00xxxx），并排除ST
+    mask = ((df_all['code'].str.startswith('sh.60')) | (df_all['code'].str.startswith('sz.00'))) & \
+           (~df_all['code_name'].str.contains('ST'))
+    df = df_all[mask].copy()
+    df.rename(columns={'code_name': 'name', 'ipoDate': 'list_date'}, inplace=True)
+
+    # 获取行业信息
+    try:
+        rs_ind = bs.query_stock_industry()
+        ind_data = []
+        while rs_ind.next():
+            ind_data.append(rs_ind.get_row_data())
+        df_ind = pd.DataFrame(ind_data, columns=rs_ind.fields)
+        df_ind = df_ind.sort_values('updateDate').groupby('code').tail(1)
+        ind_map = df_ind.set_index('code')['industry'].to_dict()
+        df['industry'] = df['code'].map(ind_map).fillna('')
+    except:
+        df['industry'] = ''
+
+    df = df[['code', 'name', 'industry', 'list_date']]
+    df.to_sql('stock_basic', conn, if_exists='replace', index=False)
+    conn.commit()
+    print(f"  ✓ 获取 {len(df)} 只股票，缓存已更新")
+
+    # 过滤退市/长期停牌
+    cutoff = (datetime.now() - timedelta(days=INACTIVE_DAYS)).strftime('%Y-%m-%d')
+    last_dates = pd.read_sql("""
+                             SELECT code, MAX(date) as last_date FROM daily
+                             WHERE code IN (SELECT code FROM stock_basic) GROUP BY code
+                             """, conn)
+    active = last_dates[last_dates['last_date'] >= cutoff]['code'].tolist()
+    removed = df[~df['code'].isin(active)]
+    if not removed.empty:
+        print(f"  ⚠ 过滤掉 {len(removed)} 只退市/停牌股: {removed['code'].tolist()}")
+    df = df[df['code'].isin(active)]
+    print(f"  ✓ 最终活跃股票 {len(df)} 只")
+    return df
+
+
+def get_latest_date(conn, code):
+    """查询某只股票在 daily 表中的最新日期，若无返回 None"""
+    row = conn.execute("SELECT MAX(date) FROM daily WHERE code=?", (code,)).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def get_market_latest_date(conn):
+    """获取数据库中所有股票的最大日期，作为最近交易日"""
+    row = conn.execute("SELECT MAX(date) FROM daily").fetchone()
+    if row and row[0]:
+        return row[0]
+    return FULL_START_DATE
+
+
+def download_one_baostock(args):
+    """
+    下载单只股票日线数据（供线程池调用）
+    args = (code, name, start_date, end_date)
+    返回 (DataFrame or None, fail_code, error_msg)
+    """
+    code, name, start_date, end_date = args
+    # ★ 每次请求前随机等待，减轻服务器压力
+    time.sleep(random.uniform(REQUEST_MIN_DELAY, REQUEST_MAX_DELAY))
+
     for retry in range(MAX_RETRY + 1):
         try:
-            # 重试前随机等待，避免多线程同时冲击
-            time.sleep(random.uniform(0.2, 0.5))
             rs = bs.query_history_k_data_plus(
-                code, "date,open,high,low,close,volume",
-                start_date=START_DATE, end_date=END_DATE,
-                frequency="d", adjustflag="2"      # 前复权
+                code,
+                "date,open,high,low,close,preclose,volume,amount,turn,tradestatus",
+                start_date=start_date.replace('-', ''),
+                end_date=end_date.replace('-', ''),
+                frequency="d",
+                adjustflag="2"  # 前复权
             )
             if rs.error_code != '0':
-                time.sleep(1 * (retry + 1))
-                continue
+                return None, code, f"查询失败: {rs.error_msg}"
             rows = []
             while rs.next():
                 rows.append(rs.get_row_data())
             if not rows:
-                return None, code
+                return None, code, "无数据返回"
             df = pd.DataFrame(rows, columns=rs.fields)
-            df.dropna(subset=['date', 'close'], inplace=True)
+            # 过滤停牌日
+            df = df[df['tradestatus'] == '1'].copy()
             if df.empty:
-                return None, code
-            # 转换数值列
-            for col in ['open', 'high', 'low', 'close', 'volume']:
+                return None, code, "全部停牌或无交易"
+            # 类型转换
+            for col in ['open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
+            # 计算涨跌幅
+            df['pct_chg'] = ((df['close'] - df['preclose']) / df['preclose'] * 100).round(2)
+            df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+            df['volume'] = df['volume'].astype(int)
+            df['amount'] = df['amount'].astype(float)
+            df['turn'] = df['turn'].astype(float)
+            df['pre_close'] = df['preclose']
+            df = df[['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'turn', 'pre_close']]
             df['code'] = code
-            df['name'] = name
-            time.sleep(REQUEST_DELAY)
-            return df, None
-        except Exception as e:
-            time.sleep(1 * (retry + 1))
-            continue
-    return None, code
+            return df, None, None
 
-def batch_write_safe(conn, df_list):
-    """通过临时表无冲突批量写入"""
+        except (BrokenPipeError, ConnectionError, OSError, socket.timeout) as e:
+            print(f"  ⚠ {code} {name} 网络异常 ({e})，重连并重试...", file=sys.stderr)
+            reconnect_baostock()
+            continue
+        except Exception as e:
+            return None, code, f"{type(e).__name__}: {e}"
+    return None, code, "多次重试后失败"
+
+
+def safe_batch_write(conn, df_list):
+    """临时表 + INSERT OR REPLACE 批量写入"""
     if not df_list:
         return
     all_df = pd.concat(df_list, ignore_index=True)
-    all_df.to_sql('daily_temp', conn, if_exists='replace', index=False, method='multi')
+    all_df.to_sql('daily_temp', conn, if_exists='replace', index=False)
     conn.execute('''
-        INSERT OR REPLACE INTO daily (code, date, name, open, high, low, close, volume)
-        SELECT code, date, name, open, high, low, close, volume FROM daily_temp
+        INSERT OR REPLACE INTO daily (code, date, name, open, high, low, close,
+                                      volume, amount, pct_chg, turn, pre_close)
+        SELECT code, date, name, open, high, low, close,
+               volume, amount, pct_chg, turn, pre_close FROM daily_temp
     ''')
     conn.execute("DROP TABLE IF EXISTS daily_temp")
     conn.commit()
 
+
 if __name__ == '__main__':
-    print(f"全量下载数据：{START_DATE} 至 {END_DATE}（{THREAD_NUM}线程，间隔{REQUEST_DELAY}秒）")
-    bs.login()
+    full_mode = '--full' in sys.argv
+    start_msg = "全量重新下载" if full_mode else "智能增量更新"
+    print(f"baostock 日线下载：{start_msg}模式")
+
+    lg = bs.login()
+    if lg.error_code != '0':
+        print(f"主线程登录失败: {lg.error_msg}")
+        sys.exit(1)
+    print("login success!")
+
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
 
-    codes = get_mainboard_codes()
-    # 更新股票基础信息表
-    basic_df = pd.DataFrame(codes, columns=['code', 'name'])
-    basic_df.to_sql('stock_basic', conn, if_exists='replace', index=False)
-    conn.commit()
-    print(f"共 {len(codes)} 只标的，{THREAD_NUM} 线程并发下载...")
-    bs.logout()                           # 主线程登出，子线程各自登录
+    # 1. 获取活跃股票列表
+    stock_info = get_stock_list_baostock(conn)
+    stock_info = pd.concat([stock_info, pd.DataFrame([{
+        'code': 'sh.000300', 'name': '沪深300', 'industry': '', 'list_date': ''
+    }])], ignore_index=True)
 
-    tasks = [(code, name) for code, name in codes]
-    success = 0
-    failed = []
-    batch_buffer = []
-    BATCH_SIZE = 50
+    # 2. 获取市场最近交易日
+    market_last_date = get_market_latest_date(conn)
+    print(f"  市场最近交易日: {market_last_date}")
 
-    with ThreadPoolExecutor(max_workers=THREAD_NUM, initializer=init_worker) as executor:
-        futures = {executor.submit(download_single_stock, task): task for task in tasks}
-        for i, future in enumerate(as_completed(futures)):
-            result, fail_code = future.result()
-            if result is not None and not result.empty:
-                batch_buffer.append(result)
-                success += 1
-                if len(batch_buffer) >= BATCH_SIZE:
-                    batch_write_safe(conn, batch_buffer)
-                    batch_buffer = []
-                    print(f"  已完成 {success}/{len(codes)} 只，已写入数据库")
+    # 3. 构建任务列表
+    task_list = []
+    skipped = 0
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    for _, row in stock_info.iterrows():
+        code = row['code']
+        name = row['name']
+        if full_mode:
+            task_list.append((code, name, FULL_START_DATE, today_str))
+        else:
+            last_date = get_latest_date(conn, code)
+            if last_date is None:
+                task_list.append((code, name, FULL_START_DATE, today_str))
+            elif last_date < market_last_date:
+                next_date = (pd.to_datetime(last_date) + timedelta(days=1)).strftime('%Y-%m-%d')
+                task_list.append((code, name, next_date, today_str))
             else:
-                failed.append(fail_code)
-            if (i+1) % 200 == 0:
-                print(f"  已处理 {i+1}/{len(codes)}")
+                skipped += 1
+
+    print(f"共需处理 {len(task_list)} 只股票，已跳过 {skipped} 只最新股票")
+    if not task_list:
+        print("全部数据已是最新，无需下载。")
+        bs.logout()
+        conn.close()
+        sys.exit(0)
+
+    print(f"{THREAD_NUM} 线程，请求间隔 {REQUEST_MIN_DELAY}~{REQUEST_MAX_DELAY} 秒，预计耗时 {len(task_list) * REQUEST_MAX_DELAY / THREAD_NUM / 60:.1f} 分钟")
+
+    bs.logout()  # 主线程登出，工作线程各自登录
+
+    success, failed_dict, batch_buffer = 0, {}, []
+    with ThreadPoolExecutor(max_workers=THREAD_NUM, initializer=init_worker) as executor:
+        future_to_code = {executor.submit(download_one_baostock, task): task for task in task_list}
+        for i, future in enumerate(as_completed(future_to_code)):
+            task = future_to_code[future]
+            code, name, _, _ = task
+            try:
+                df, fail_code, err_msg = future.result()
+            except Exception as e:
+                err_msg = f"Future异常: {type(e).__name__}: {e}"
+                failed_dict[code] = err_msg
+                print(f"  ⚠ {code} {name} {err_msg}", file=sys.stderr)
+                continue
+
+            if df is not None and not df.empty:
+                df['name'] = name
+                batch_buffer.append(df)
+                success += 1
+                if len(batch_buffer) >= 50:
+                    safe_batch_write(conn, batch_buffer)
+                    batch_buffer = []
+                    print(f"  已完成 {success}/{len(task_list)} 只")
+            else:
+                failed_dict[code] = err_msg
+                print(f"  ✗ {code} {name} 失败: {err_msg}")
+
+            if (i + 1) % 100 == 0:
+                print(f"  已处理 {i+1}/{len(task_list)}")
 
     if batch_buffer:
-        batch_write_safe(conn, batch_buffer)
-
+        safe_batch_write(conn, batch_buffer)
+    conn.commit()
     conn.close()
-    print(f"\n下载完成，成功 {success}/{len(codes)} 只")
-    if failed:
-        print(f"失败 {len(failed)} 只，将在下次运行时自动补充")
-    print(f"数据库保存至 {DB_PATH}")
+
+    print(f"\n下载完成，成功 {success}/{len(task_list)} 只")
+    if failed_dict:
+        print(f"失败 {len(failed_dict)} 只，详情写入 failed_daily_bs.txt")
+        with open('failed_daily_bs.txt', 'w') as f:
+            for code, reason in failed_dict.items():
+                f.write(f"{code},{reason}\n")
+        print("前10条失败示例:")
+        for code, reason in list(failed_dict.items())[:10]:
+            print(f"  {code}: {reason}")
