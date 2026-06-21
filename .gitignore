@@ -1,11 +1,9 @@
 /.idea/
+__pycache__/
 selected_stocks.txt
 stocks_2y.db
 /stocks_2y.db-shm
 /stocks_2y.db-wal
 !/.claude/
-!/.venv/
-!/venv/
-!/selected_stocks_detail.txt
 /selected_stocks_detail.txt
 /failed_daily.txt

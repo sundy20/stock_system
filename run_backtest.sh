@@ -1,5 +1,5 @@
 #!/bin/bash
-cd /Users/plus/AI/stock_system
+cd "$(dirname "$0")"
 source venv/bin/activate
 echo "===== 选股回测 + 导出 ====="
 python3 backtest_twice_retest.py

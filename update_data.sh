@@ -1,5 +1,5 @@
 #!/bin/bash
-cd /Users/plus/AI/stock_system
+cd "$(dirname "$0")"
 source venv/bin/activate
 echo "===== 更新日线数据（tushare） ====="
 python3 download_daily_tushare.py

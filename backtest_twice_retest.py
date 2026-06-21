@@ -12,7 +12,9 @@
         C. 周线二次回踩 + 周线布林扩张(双模式)
 
 v3.1 优化：
-    - 周线布林扩张启用双模式：标准扩张（带宽上穿+连续上升） 与 收缩预警（带宽压缩至0.9以内且开始放大）并行
+    - 前视偏差修复：选股只使用 target_date 及之前的数据
+    - 涨跌停保护：买入跳过涨停股，卖出跳过跌停股
+    - 周线布林扩张启用双模式：标准扩张（带宽上穿+连续上升）与收缩预警（带宽压缩至0.95以内且开始放大）并行
     - 高位过滤：收盘价 ≤ 20周均线 × 1.15
     - 月线布林扩张不要求中轨方向
 """
@@ -76,6 +78,7 @@ MA_DIR_PERIOD = 3
 FIN_CONSEC = 2
 MIN_PROFIT_YOY = 0.0
 MIN_PNI_YOY = 0.0              # 扣非若为NULL则跳过
+MIN_NET_PROFIT = 10000000      # 新增：单季度净利润 ≥ 1000万（若有数据）
 
 # -------------------- 交易费率 --------------------
 COMMISSION = 0.0001
@@ -86,14 +89,14 @@ REBALANCE_FREQ = 'W'
 
 # ===================== 数据加载 =====================
 def load_all_data(conn):
-    query = """SELECT code, date, open, high, low, close, volume, amount
+    query = """SELECT code, date, open, high, low, close, volume, amount, pct_chg
                FROM daily WHERE date >= '2018-01-01' ORDER BY code, date"""
     df = pd.read_sql(query, conn, parse_dates=['date'])
     return df.set_index(['code', 'date']).sort_index()
 
 
 def load_financial_data(conn):
-    query = """SELECT code, stat_date, pub_date, net_profit_yoy, revenue_yoy, yoy_pni
+    query = """SELECT code, stat_date, pub_date, net_profit_yoy, revenue_yoy, yoy_pni, net_profit
                FROM financial WHERE net_profit_yoy IS NOT NULL ORDER BY code, stat_date"""
     df = pd.read_sql(query, conn, parse_dates=['stat_date', 'pub_date'])
     df['effective_date'] = df['pub_date'].fillna(df['stat_date'] + timedelta(days=30)) + timedelta(days=10)
@@ -212,6 +215,8 @@ def vectorized_select_stocks(conn, df_daily, df_fin, name_map, industry_map, tar
     if target_date is None:
         target_date = df_daily.index.get_level_values('date').max()
     target_date = pd.Timestamp(target_date)
+    # ★ 防止前视偏差：只保留 target_date 及之前的数据
+    df_daily = df_daily[df_daily.index.get_level_values('date') <= target_date]
 
     valid_codes = get_valid_codes(conn, df_daily, target_date)
     df_stocks = df_daily[df_daily.index.get_level_values('code').isin(valid_codes)].copy()
@@ -294,10 +299,11 @@ def vectorized_select_stocks(conn, df_daily, df_fin, name_map, industry_map, tar
     fin_latest = fin_before.sort_values('effective_date').groupby('code').tail(FIN_CONSEC)
     fin_pass = fin_latest.groupby('code').filter(
         lambda x: (len(x) == FIN_CONSEC) and all(x['net_profit_yoy'] > MIN_PROFIT_YOY) and
-                  all((x['yoy_pni'].isna()) | (x['yoy_pni'] > MIN_PNI_YOY))
+                  all((x['yoy_pni'].isna()) | (x['yoy_pni'] > MIN_PNI_YOY)) and
+                  all((x['net_profit'].isna()) | (x['net_profit'] >= MIN_NET_PROFIT))
     )
     fin_codes = fin_pass['code'].unique().tolist()
-    print(f"财务符合（扣非缺失也放过）：{len(fin_codes)} 只")
+    print(f"财务符合（扣非缺失也放过，利润≥1000万若存在）：{len(fin_codes)} 只")
 
     core_set = set(base_codes) & set(m_retest_codes) & set(m_bb_codes) & set(w_retest_codes) & set(w_bb_codes) & set(fin_codes)
     hard_base = set(base_codes) & (set(m_retest_codes) | set(w_retest_codes)) & set(fin_codes)
@@ -337,6 +343,9 @@ def run_backtest(conn, df_daily, df_fin, name_map, industry_map, start, end):
     periods = stock_close.index.to_period(freq)
     rebalance_dates = stock_close.groupby(periods).apply(lambda x: x.index[-1]).values
 
+    # 涨跌幅数据（用于涨跌停判断）
+    pct_chg_df = df_daily['pct_chg'].unstack(level='code')
+
     cash = INIT_CASH
     holdings = {}
     net_vals = []
@@ -346,6 +355,10 @@ def run_backtest(conn, df_daily, df_fin, name_map, industry_map, start, end):
         d = pd.Timestamp(d_raw)
         sel, _, _ = vectorized_select_stocks(conn, df_daily, df_fin, name_map, industry_map, target_date=d)
         targets = [s[0] for s in sel if s[0] in stock_close.columns]
+        # 涨跌停检测
+        today_pct = pct_chg_df.loc[d] if d in pct_chg_df.index else pd.Series(dtype=float)
+        limit_up_codes = set(today_pct[today_pct >= 9.8].index)
+        limit_down_codes = set(today_pct[today_pct <= -9.8].index)
         if last_date is not None:
             mask = (stock_close.index > last_date) & (stock_close.index < d)
             for day in stock_close.index[mask]:
@@ -353,17 +366,21 @@ def run_backtest(conn, df_daily, df_fin, name_map, industry_map, start, end):
                 net_vals.append((day, val))
         for c in list(holdings.keys()):
             if c in stock_close.columns:
-                cash += holdings[c] * stock_close.loc[d, c] * (1 - COMMISSION - STAMP_DUTY)
+                sell_cost = max(holdings[c] * stock_close.loc[d, c] * (COMMISSION + STAMP_DUTY), 5.0)
+                cash += holdings[c] * stock_close.loc[d, c] - sell_cost
         holdings.clear()
         if targets:
-            prices = stock_close.loc[d, targets]
-            avg_cash = cash / len(prices)
-            for c in targets:
-                price = prices[c]
-                shares = int(avg_cash / (price * (1 + COMMISSION + SLIPPAGE))) // 100 * 100
-                if shares > 0:
-                    cash -= shares * price * (1 + COMMISSION + SLIPPAGE)
-                    holdings[c] = shares
+            buy_targets = [c for c in targets if c not in limit_up_codes and c not in limit_down_codes]
+            if buy_targets:
+                prices = stock_close.loc[d, buy_targets]
+                avg_cash = cash / len(prices)
+                for c in buy_targets:
+                    price = prices[c]
+                    buy_cost = max(price * COMMISSION, 5.0)
+                    shares = int(avg_cash / (price + buy_cost + price * SLIPPAGE)) // 100 * 100
+                    if shares > 0:
+                        cash -= shares * (price + buy_cost / shares + price * SLIPPAGE)
+                        holdings[c] = shares
         val = cash + sum(holdings.get(c, 0) * stock_close.loc[d, c] for c in holdings if c in stock_close.columns)
         net_vals.append((d, val))
         last_date = d
