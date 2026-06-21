@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-baostock 日线数据下载（前复权）—— 单线程优化版（备选主力）
+baostock 日线数据下载（前复权）—— 最终稳定版（独立登录，完整注释）
 - 默认增量模式：仅下载缺失数据（与数据库最新交易日的差距）
 - 全量模式：python3 download_2years.py --full  强制从2018年起全量重新下载
 - 自动过滤 ST / 退市 / 长期停牌（最新交易日距今>60天）股票
 - 保存字段：open,high,low,close,volume,amount(元),pct_chg(%),turn(%),pre_close
-- 单线程运行，每次请求前随机等待 0.2~1.0 秒，避免服务器压力
+- 单线程，工作线程独立登录，请求间隔 0.2~1.0 秒随机，避免服务器压力
 - 使用临时表 + INSERT OR REPLACE 写入
 - 股票列表自动更新到 stock_basic 表（含行业、上市日期）
 - 失败股票输出到 failed_daily_bs.txt，附带具体异常信息
@@ -19,7 +19,7 @@ import baostock as bs
 # ===================== 配置 =====================
 DB_PATH = 'stocks_2y.db'
 FULL_START_DATE = '2018-01-01'        # 全量下载的起始日期
-THREAD_NUM = 1                        # 单线程，与财务下载保持一致
+THREAD_NUM = 1                        # 单线程，杜绝高频并发
 REQUEST_MIN_DELAY = 0.2               # 每次请求前最小随机等待（秒）
 REQUEST_MAX_DELAY = 1.0               # 最大随机等待（秒）
 INACTIVE_DAYS = 60                    # 退市判定：最新交易日距今超过此天数即过滤
@@ -213,6 +213,7 @@ if __name__ == '__main__':
     start_msg = "全量重新下载" if full_mode else "智能增量更新"
     print(f"baostock 日线下载：{start_msg}模式")
 
+    # ★ 主线程登录，整个过程只登录这一次
     lg = bs.login()
     if lg.error_code != '0':
         print(f"主线程登录失败: {lg.error_msg}")
@@ -222,7 +223,7 @@ if __name__ == '__main__':
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
 
-    # 1. 获取活跃股票列表
+    # 1. 获取活跃股票列表（含行业、上市日期）
     stock_info = get_stock_list_baostock(conn)
     stock_info = pd.concat([stock_info, pd.DataFrame([{
         'code': 'sh.000300', 'name': '沪深300', 'industry': '', 'list_date': ''
@@ -258,9 +259,10 @@ if __name__ == '__main__':
         conn.close()
         sys.exit(0)
 
-    print(f"{THREAD_NUM} 线程，请求间隔 {REQUEST_MIN_DELAY}~{REQUEST_MAX_DELAY} 秒，预计耗时 {len(task_list) * REQUEST_MAX_DELAY / THREAD_NUM / 60:.1f} 分钟")
+    print(f"单线程运行，请求间隔 {REQUEST_MIN_DELAY}~{REQUEST_MAX_DELAY} 秒，预计耗时 {len(task_list) * REQUEST_MAX_DELAY / 60:.1f} 分钟")
 
-    bs.logout()  # 主线程登出，工作线程各自登录
+    # ★ 主线程登出，工作线程通过 init_worker 独立登录
+    bs.logout()
 
     success, failed_dict, batch_buffer = 0, {}, []
     with ThreadPoolExecutor(max_workers=THREAD_NUM, initializer=init_worker) as executor:
@@ -305,3 +307,5 @@ if __name__ == '__main__':
         print("前10条失败示例:")
         for code, reason in list(failed_dict.items())[:10]:
             print(f"  {code}: {reason}")
+
+    bs.logout()

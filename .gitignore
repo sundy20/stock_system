@@ -4,6 +4,8 @@ selected_stocks.txt
 stocks_2y.db
 /stocks_2y.db-shm
 /stocks_2y.db-wal
-!/.claude/
+/.claude/
 /selected_stocks_detail.txt
 /failed_daily.txt
+/custom_watchlist.txt
+/custom_selection_report.txt

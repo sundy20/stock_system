@@ -18,7 +18,7 @@ SELECT COUNT(DISTINCT code) FROM financial;
 
 SELECT code, stat_date, net_profit_yoy, yoy_pni FROM financial WHERE code='sh.600519' ORDER BY stat_date DESC LIMIT 5;
 
-SELECT * FROM financial where yoy_pni is not null ;
+SELECT * FROM financial;
 
 -- 连续两期净利润>0的股票数
 SELECT COUNT(*) FROM (
@@ -39,9 +39,5 @@ WHERE code='sh.603799' ORDER BY stat_date DESC LIMIT 4;
 
 DELETE FROM stock_basic WHERE code IN ('sz.001331','sh.600228','sh.600717','sh.603137','sh.603159','sh.603721');
 
-SELECT code, stat_date, pub_date, net_profit_yoy, yoy_pni
-FROM financial
-WHERE code='sh.600113'
-ORDER BY stat_date DESC
-LIMIT 4;
+SELECT code, stat_date, net_profit_yoy, net_profit, yoy_pni, express_gryoy FROM financial WHERE code='sh.600519' ORDER BY stat_date DESC LIMIT 4;
 
