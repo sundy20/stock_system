@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-baostock 财务数据下载——最终版，双线程，增量更新，防封禁
-- 主线程登录验证，失败直接退出
-- 工作线程独立登录，失败报错
-- 每只股票每次查询前随机等待 0.5~1.5 秒，避免高频被封
-- 网络异常自动重连，重连等待 5~10 秒
-- 增量模式只补充缺失的季度（最近两年，以 net_profit_yoy 是否存在为准）
-- 全量模式：python3 download_financials.py --full
-- 失败记录写入 failed_financial.txt，附具体原因
+baostock 财务数据下载——智能增量更新，全字段，超时保护，断网重连
+- 默认增量模式：仅补充缺失的季度数据（最近两年，以net_profit_yoy是否存在为准）
+- 全量模式：python3 download_financials.py --full  强制全量重新下载
+- 单线程运行（THREAD_NUM=1），请求间隔 0.5~1.5 秒随机，避免高频被封
+- 保存字段：净利润同比、营收同比(留空)、净资产同比、总资产同比、EPS同比、扣非净利润同比
+- 失败股票输出到 failed_financial.txt，附带具体原因
 """
 import baostock as bs
 import sqlite3
@@ -16,16 +14,15 @@ from datetime import datetime
 import time, sys, socket, random
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
-# ===================== 配置 =====================
 DB_PATH = 'stocks_2y.db'
-THREAD_NUM = 2                # 双线程，日常安全
+THREAD_NUM = 1                # 单线程，防止高频被封
 REQUEST_MIN_DELAY = 0.5       # 每次查询前最小随机等待（秒）
 REQUEST_MAX_DELAY = 1.5       # 最大随机等待（秒）
-MAX_RETRY = 2                 # 单只股票最大重试次数
-SINGLE_TASK_TIMEOUT = 180     # 单任务超时（秒）
-SOCKET_TIMEOUT = 180          # 底层 Socket 超时
+MAX_RETRY = 2                 # 最大重试次数
+SINGLE_TASK_TIMEOUT = 180     # 单任务超时
+SOCKET_TIMEOUT = 180
 CURRENT_YEAR = datetime.now().year
-QUARTERS = [1, 2, 3, 4]      # 季度
+QUARTERS = [1, 2, 3, 4]
 
 
 def reconnect_baostock():
@@ -44,7 +41,7 @@ def reconnect_baostock():
 
 
 def init_worker():
-    """线程初始化：设置 Socket 超时并登录；失败直接抛出异常"""
+    """线程初始化：设置 Socket 超时并登录；失败则抛出异常"""
     socket.setdefaulttimeout(SOCKET_TIMEOUT)
     lg = bs.login()
     if lg.error_code != '0':
@@ -98,11 +95,10 @@ def get_missing_quarters(conn, code):
 
 def download_single_financial(args):
     """
-    下载单只股票指定季度的财务数据，返回 (DataFrame_or_None, fail_code, error_msg)
-    每次查询前随机等待 REQUEST_MIN_DELAY~REQUEST_MAX_DELAY 秒
+    下载单只股票指定季度的财务数据
+    返回 (DataFrame_or_None, fail_code, error_msg)
     """
     code, name, year, quarter = args
-    # ★ 每次查询前随机延迟，避免高频请求
     time.sleep(random.uniform(REQUEST_MIN_DELAY, REQUEST_MAX_DELAY))
 
     for retry in range(MAX_RETRY + 1):
@@ -118,7 +114,6 @@ def download_single_financial(args):
 
             fields = [f.lower() for f in rs.fields]
             df = pd.DataFrame(rows, columns=rs.fields)
-            # 字段映射
             col_map = {
                 'yoyni': 'net_profit_yoy',
                 'yoyequity': 'yoy_equity',
@@ -192,10 +187,8 @@ if __name__ == '__main__':
     codes = get_mainboard_codes(conn)
     total = len(codes)
 
-    # 动态设置整体超时（单任务较慢，适当放宽）
     OVERALL_TIMEOUT = 3600 if full_mode else 1200
 
-    # 构建任务列表
     tasks = []
     skipped = 0
     for code, name in codes:
@@ -218,7 +211,7 @@ if __name__ == '__main__':
         sys.exit(0)
 
     print(f"{THREAD_NUM} 线程，整体超时 {OVERALL_TIMEOUT} 秒，请求间隔 {REQUEST_MIN_DELAY}~{REQUEST_MAX_DELAY} 秒")
-    bs.logout()  # 主线程登出
+    bs.logout()
 
     success, failed_stocks, batch_buffer = 0, {}, []
     with ThreadPoolExecutor(max_workers=THREAD_NUM, initializer=init_worker) as executor:

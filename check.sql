@@ -39,3 +39,8 @@ WHERE code='sh.603799' ORDER BY stat_date DESC LIMIT 4;
 
 DELETE FROM stock_basic WHERE code IN ('sz.001331','sh.600228','sh.600717','sh.603137','sh.603159','sh.603721');
 
+SELECT code, stat_date, pub_date, net_profit_yoy, yoy_pni
+FROM financial
+WHERE code='sh.600113'
+ORDER BY stat_date DESC
+LIMIT 4;

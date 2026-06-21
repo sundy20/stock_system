@@ -14,7 +14,6 @@ import os, sys, time, sqlite3, pandas as pd
 from datetime import datetime, timedelta
 import tushare as ts
 
-# ===================== 配置 =====================
 TOKEN = os.getenv('TUSHARE_TOKEN')
 if not TOKEN:
     raise RuntimeError("请先设置环境变量 TUSHARE_TOKEN")
