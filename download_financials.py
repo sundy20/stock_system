@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-baostock 财务数据下载——最终稳定版（主线程直接执行，彻底避免卡死）
+baostock 财务数据下载——最终稳定版（主线程顺序执行，完整注释，抑制警告）
 - 默认增量模式：仅补充缺失的季度数据（最近两年）
 - 全量模式：python3 download_financials.py --full  强制全量重新下载
 - 单线程直接顺序执行，请求间隔 0.2~1.0 秒随机，避免高频被封
 - 断网重连等待 10~20 秒
 - 保存字段：成长能力 + 盈利能力 + 业绩快报
 - 失败股票输出到 failed_financial.txt，附带具体错误码和错误信息
+- 抑制 pandas FutureWarning，保持输出界面整洁
 """
+import warnings
 import baostock as bs
 import sqlite3
 import pandas as pd
 from datetime import datetime
 import time, sys, socket, random
+
+# 忽略 pandas 未来版本警告，保持输出界面整洁
+warnings.filterwarnings('ignore', category=FutureWarning)
 
 DB_PATH = 'stocks_2y.db'
 REQUEST_MIN_DELAY = 0.2       # 每次查询前最小随机等待（秒）
@@ -22,7 +27,7 @@ SOCKET_TIMEOUT = 180          # 底层 Socket 超时（秒）
 CURRENT_YEAR = datetime.now().year
 QUARTERS = [1, 2, 3, 4]      # 四个季度
 
-# 定义所有需要写入的列，确保临时表包含这些列
+# 需要写入 financial 表的所有列，确保临时表结构完整
 ALL_COLUMNS = [
     'code', 'name', 'pub_date', 'stat_date',
     'net_profit_yoy', 'revenue_yoy',
@@ -192,7 +197,7 @@ def download_single(code, name, year, quarter):
             except:
                 pass
 
-            # ★ 构造完整记录，显式包含所有列，缺失的用 None
+            # ★ 显式构造所有字段，缺失的用 None
             record = {
                 'code': code,
                 'name': name,
@@ -224,17 +229,15 @@ def download_single(code, name, year, quarter):
 
 
 def batch_write_safe(conn, df_list):
-    """临时表 + INSERT OR REPLACE 批量写入"""
+    """临时表 + INSERT OR REPLACE 批量写入（自动补齐缺失列）"""
     if not df_list:
         return
-    # 拼接所有 DataFrame
     all_df = pd.concat(df_list, ignore_index=True)
-    # ★ 确保所有列都存在，缺失的填充 None
+    # 确保所有需要的列都存在，缺失的填充 None
     for col in ALL_COLUMNS:
         if col not in all_df.columns:
             all_df[col] = None
-    # 只保留需要的列并按顺序排列
-    all_df = all_df[ALL_COLUMNS]
+    all_df = all_df[ALL_COLUMNS]  # 保持列顺序一致
     # 写入临时表
     all_df.to_sql('financial_temp', conn, if_exists='replace', index=False)
     # 执行 INSERT OR REPLACE
@@ -265,6 +268,7 @@ if __name__ == '__main__':
     mode_str = '全量重新下载' if full_mode else '智能增量更新'
     print(f"登录 baostock ... （{mode_str}）")
 
+    # ★ 主线程登录一次，全程不登出
     lg = bs.login()
     if lg.error_code != '0':
         print(f"主线程登录失败: {lg.error_msg}")
