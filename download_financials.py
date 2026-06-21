@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-baostock 财务数据下载——最终稳定版（主线程顺序执行，完整注释，抑制警告）
+baostock 财务数据下载——最终优化版（智能季度、缩短延迟、失败不重试）
 - 默认增量模式：仅补充缺失的季度数据（最近两年）
 - 全量模式：python3 download_financials.py --full  强制全量重新下载
-- 单线程直接顺序执行，请求间隔 0.2~1.0 秒随机，避免高频被封
+- 单线程顺序执行，请求间隔 0.1~0.5 秒随机，高效且安全
+- 智能跳过未到季报截止日的季度，避免无效请求
+- 仅对网络错误进行重试，确定性失败直接跳过
 - 断网重连等待 10~20 秒
 - 保存字段：成长能力 + 盈利能力 + 业绩快报
-- 失败股票输出到 failed_financial.txt，附带具体错误码和错误信息
-- 抑制 pandas FutureWarning，保持输出界面整洁
+- 失败股票输出到 failed_financial.txt，附带具体错误信息
 """
 import warnings
 import baostock as bs
@@ -16,18 +17,17 @@ import pandas as pd
 from datetime import datetime
 import time, sys, socket, random
 
-# 忽略 pandas 未来版本警告，保持输出界面整洁
 warnings.filterwarnings('ignore', category=FutureWarning)
 
 DB_PATH = 'stocks_2y.db'
-REQUEST_MIN_DELAY = 0.2       # 每次查询前最小随机等待（秒）
-REQUEST_MAX_DELAY = 1.0       # 最大随机等待（秒）
-MAX_RETRY = 2                 # 最大重试次数
-SOCKET_TIMEOUT = 180          # 底层 Socket 超时（秒）
+REQUEST_MIN_DELAY = 0.1       # 最小请求间隔（秒），缩短以提高效率
+REQUEST_MAX_DELAY = 0.5       # 最大请求间隔（秒），缩短以提高效率
+MAX_RETRY = 1                 # 网络错误重试次数（仅网络问题）
+SOCKET_TIMEOUT = 180
 CURRENT_YEAR = datetime.now().year
-QUARTERS = [1, 2, 3, 4]      # 四个季度
+QUARTERS = [1, 2, 3, 4]
 
-# 需要写入 financial 表的所有列，确保临时表结构完整
+# 需要写入 financial 表的所有列
 ALL_COLUMNS = [
     'code', 'name', 'pub_date', 'stat_date',
     'net_profit_yoy', 'revenue_yoy',
@@ -75,11 +75,27 @@ def init_db(conn):
     conn.commit()
 
 
+def is_quarter_available(year, quarter):
+    """
+    根据A股季报披露规则，判断该季度数据现在是否可能已发布。
+    Q1: 4月30日截止 → 5月5日起可查
+    Q2: 8月31日截止 → 9月5日起可查
+    Q3: 10月31日截止 → 11月5日起可查
+    Q4: 次年4月30日截止 → 次年5月5日起可查
+    """
+    if quarter == 1:
+        deadline = pd.Timestamp(year=year, month=5, day=5)
+    elif quarter == 2:
+        deadline = pd.Timestamp(year=year, month=9, day=5)
+    elif quarter == 3:
+        deadline = pd.Timestamp(year=year, month=11, day=5)
+    else:
+        deadline = pd.Timestamp(year=year+1, month=5, day=5)
+    return pd.Timestamp.now() >= deadline
+
+
 def get_missing_quarters(conn, code):
-    """
-    返回该股票最近两年缺失的季度列表 [(year, quarter, stat_date)]
-    判断标准：stat_date 不存在，或 net_profit_yoy 为 NULL
-    """
+    """返回该股票最近两年缺失的季度列表，同时考虑季报是否可查"""
     existing = set()
     rows = conn.execute("""
                         SELECT stat_date FROM financial
@@ -91,6 +107,8 @@ def get_missing_quarters(conn, code):
     missing = []
     for year in [CURRENT_YEAR - 1, CURRENT_YEAR]:
         for quarter in QUARTERS:
+            if not is_quarter_available(year, quarter):
+                continue
             if quarter == 1:
                 sd = f"{year}-03-31"
             elif quarter == 2:
@@ -99,9 +117,6 @@ def get_missing_quarters(conn, code):
                 sd = f"{year}-09-30"
             else:
                 sd = f"{year}-12-31"
-            # ★ 跳过未来季度（财报不可能已发布）
-            if pd.Timestamp(sd) > pd.Timestamp.now():
-                continue
             if sd not in existing:
                 missing.append((year, quarter, sd))
     return missing
@@ -109,9 +124,8 @@ def get_missing_quarters(conn, code):
 
 def download_single(code, name, year, quarter):
     """
-    下载单只股票指定季度的财务数据（成长能力 + 盈利能力 + 业绩快报）
-    只要成长能力接口有数据就算成功
-    返回 (DataFrame_or_None, error_msg)
+    下载单只股票指定季度的财务数据。
+    网络错误会重试，其他错误直接返回。
     """
     time.sleep(random.uniform(REQUEST_MIN_DELAY, REQUEST_MAX_DELAY))
 
@@ -148,13 +162,11 @@ def download_single(code, name, year, quarter):
                         growth_data['pub_date'] = str(pd.to_datetime(df[pub_date_col].iloc[0]).date()) if pub_date_col else ''
                         growth_data['stat_date'] = sd
             else:
-                if retry == MAX_RETRY:
-                    return None, f"成长能力接口错误: error_code={rs.error_code}, msg={rs.error_msg}"
+                # 非网络错误，直接失败
+                return None, f"成长能力接口错误: error_code={rs.error_code}, msg={rs.error_msg}"
 
             if not growth_data:
-                if retry < MAX_RETRY:
-                    continue
-                return None, f"成长能力无数据 (error_code={rs.error_code})"
+                return None, "成长能力无数据"
 
             # 2. 盈利能力（可选）
             try:
@@ -197,10 +209,8 @@ def download_single(code, name, year, quarter):
             except:
                 pass
 
-            # ★ 显式构造所有字段，缺失的用 None
             record = {
-                'code': code,
-                'name': name,
+                'code': code, 'name': name,
                 'pub_date': growth_data.get('pub_date', ''),
                 'stat_date': growth_data.get('stat_date', f"{year}-{quarter*3:02d}-31"),
                 'net_profit_yoy': growth_data.get('net_profit_yoy'),
@@ -225,7 +235,7 @@ def download_single(code, name, year, quarter):
             continue
         except Exception as e:
             return None, f"{type(e).__name__}: {e}"
-    return None, "多次重试后仍失败"
+    return None, "网络重试后仍失败"
 
 
 def batch_write_safe(conn, df_list):
@@ -233,14 +243,11 @@ def batch_write_safe(conn, df_list):
     if not df_list:
         return
     all_df = pd.concat(df_list, ignore_index=True)
-    # 确保所有需要的列都存在，缺失的填充 None
     for col in ALL_COLUMNS:
         if col not in all_df.columns:
             all_df[col] = None
-    all_df = all_df[ALL_COLUMNS]  # 保持列顺序一致
-    # 写入临时表
+    all_df = all_df[ALL_COLUMNS]
     all_df.to_sql('financial_temp', conn, if_exists='replace', index=False)
-    # 执行 INSERT OR REPLACE
     conn.execute('''
         INSERT OR REPLACE INTO financial (
             code, name, pub_date, stat_date,
@@ -268,7 +275,6 @@ if __name__ == '__main__':
     mode_str = '全量重新下载' if full_mode else '智能增量更新'
     print(f"登录 baostock ... （{mode_str}）")
 
-    # ★ 主线程登录一次，全程不登出
     lg = bs.login()
     if lg.error_code != '0':
         print(f"主线程登录失败: {lg.error_msg}")
@@ -281,22 +287,13 @@ if __name__ == '__main__':
     codes = get_mainboard_codes(conn)
     total = len(codes)
 
-    # 构建任务列表
     tasks = []
     skipped = 0
     for code, name in codes:
         if full_mode:
             for y in [CURRENT_YEAR - 1, CURRENT_YEAR]:
                 for q in QUARTERS:
-                    if q == 1:
-                        q_end = f"{y}-03-31"
-                    elif q == 2:
-                        q_end = f"{y}-06-30"
-                    elif q == 3:
-                        q_end = f"{y}-09-30"
-                    else:
-                        q_end = f"{y}-12-31"
-                    if pd.Timestamp(q_end) > pd.Timestamp.now():
+                    if not is_quarter_available(y, q):
                         continue
                     tasks.append((code, name, y, q))
         else:
@@ -316,7 +313,6 @@ if __name__ == '__main__':
     print(f"主线程直接执行，请求间隔 {REQUEST_MIN_DELAY}~{REQUEST_MAX_DELAY} 秒")
     print(f"预计耗时 {len(tasks) * (REQUEST_MIN_DELAY + REQUEST_MAX_DELAY) / 2 / 60:.1f} 分钟")
 
-    # 主循环顺序处理
     success = 0
     failed_stocks = {}
     batch_buffer = []

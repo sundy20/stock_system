@@ -114,9 +114,10 @@ def get_valid_codes(conn, df_daily, target_date):
 # ===================== 年度趋势 =====================
 def check_annual_trend(code, df_stocks, target_date, yearly_data):
     """
-    检查年线趋势（滚动或自然年任一满足即可）
+    检查年线趋势（滚动、自然年收红放量、自然年收红 任一满足即可）
     - 滚动：最近250交易日涨幅≥15%且日均成交额增长≥30%，收盘价≥250日均线，斜率≥0
-    - 自然年：上一个完整自然年收红且放量
+    - 自然年收红放量：上一个完整自然年收红且放量（已冗余，被收红条件覆盖）
+    - 自然年收红（新增）：上一个完整自然年收红，不要求放量
     """
     code_data = df_stocks.loc[code].sort_index()
     rolling_ok = False
@@ -134,7 +135,7 @@ def check_annual_trend(code, df_stocks, target_date, yearly_data):
         slope_ok = slope >= MA_SLOPE_THRESHOLD
         rolling_ok = price_up and vol_up and above_ma and slope_ok
 
-    # 2. 自然年验证（去年放量收红）
+    # 2. 自然年验证（收红即通过，不要求放量）
     natural_ok = False
     if code in yearly_data.index.get_level_values('code'):
         df_y = yearly_data.loc[code].sort_index()
@@ -143,11 +144,12 @@ def check_annual_trend(code, df_stocks, target_date, yearly_data):
         if last_year in years:
             row = df_y.loc[last_year]
             red = row['last_close'] > row['first_open']
-            if last_year - 1 in years:
-                vol_up = row['total_volume'] > df_y.loc[last_year - 1]['total_volume']
-            else:
-                vol_up = True  # 无前一年数据，仅要求收红
-            natural_ok = red and vol_up
+            natural_ok = red  # ← 不再要求放量
+        else:
+            # 没有去年数据（次新股），要求上市以来上涨
+            first_open = df_y.iloc[0]['first_open']
+            last_close = df_y.iloc[-1]['last_close']
+            natural_ok = last_close > first_open
 
     return rolling_ok or natural_ok
 
