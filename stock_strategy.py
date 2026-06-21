@@ -85,7 +85,8 @@ def load_all_data(conn):
 
 def load_financial_data(conn):
     """加载财务数据，计算生效日期（pub_date + 10天）"""
-    query = """SELECT code, stat_date, pub_date, net_profit_yoy, revenue_yoy, yoy_pni, net_profit
+    query = """SELECT code, stat_date, pub_date, net_profit_yoy, revenue_yoy,
+                      yoy_pni, net_profit, roe_avg, gp_margin
                FROM financial WHERE net_profit_yoy IS NOT NULL ORDER BY code, stat_date"""
     df = pd.read_sql(query, conn, parse_dates=['stat_date', 'pub_date'])
     # 发布日 +10 天生效，避免未来函数
@@ -255,8 +256,14 @@ def detect_bb_expand(price_df, period=20, std_mult=2, short_ma=5, long_ma=20,
 # ===================== 财务筛选辅助 =====================
 def apply_financial_filter(fin_codes_base, df_fin, target_date):
     """
-    根据财务数据过滤股票代码列表，返回通过财务条件的代码列表
-    若关闭财务开关，则直接返回原始列表
+    根据财务数据过滤股票代码列表，返回通过财务条件的代码列表。
+    条件（连续 FIN_CONSEC 个季度同时满足）：
+        - 归母净利润同比 > MIN_PROFIT_YOY
+        - 扣非净利润同比 > MIN_PNI_YOY（若缺失则跳过）
+        - 单季度净利润 ≥ MIN_NET_PROFIT（若缺失则跳过）
+        - 净资产收益率 > 0（若缺失则跳过）
+        - 销售毛利率 > 0（若缺失则跳过）
+    若关闭财务开关，则直接返回原始列表。
     """
     if not USE_FINANCIAL_FILTER:
         return fin_codes_base
@@ -270,6 +277,8 @@ def apply_financial_filter(fin_codes_base, df_fin, target_date):
         lambda x: (len(x) == FIN_CONSEC) and
                   all(x['net_profit_yoy'] > MIN_PROFIT_YOY) and
                   all((x['yoy_pni'].isna()) | (x['yoy_pni'] > MIN_PNI_YOY)) and
-                  all((x['net_profit'].isna()) | (x['net_profit'] >= MIN_NET_PROFIT))
+                  all((x['net_profit'].isna()) | (x['net_profit'] >= MIN_NET_PROFIT)) and
+                  all((x['roe_avg'].isna()) | (x['roe_avg'] > 0)) and
+                  all((x['gp_margin'].isna()) | (x['gp_margin'] > 0))
     )
     return fin_pass['code'].unique().tolist()

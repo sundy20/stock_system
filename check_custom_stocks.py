@@ -4,22 +4,19 @@
 使用方法：
   1. 在同花顺中导出自选股，保存为 custom_watchlist.txt（每行格式：代码,名称）
   2. 运行 python3 check_custom_stocks.py
-  3. 查看输出报告 custom_selection_report.txt，包含符合/不符合条件及详细原因
+  3. 查看输出报告 custom_selection_report.csv（逗号分隔，代码无前缀）
 """
 
 import sqlite3, pandas as pd, os, sys
 from datetime import datetime, timedelta
-import stock_strategy as st                                # 导入公共策略模块
+import stock_strategy as st
 
 WATCHLIST_FILE = 'custom_watchlist.txt'
-REPORT_FILE = 'custom_selection_report.txt'
+REPORT_FILE = 'custom_selection_report.csv'          # 改为 CSV 格式
 
 
 def parse_watchlist(filename):
-    """
-    解析同花顺导出的自选股文件，返回 [(内部代码, 原始名称), ...]
-    支持多种格式：600519、600519.SH、sh.600519 等
-    """
+    """解析同花顺导出的自选股文件，返回 [(内部代码, 原始名称), ...]"""
     codes = []
     with open(filename, 'r', encoding='utf-8') as f:
         for line in f:
@@ -33,7 +30,7 @@ def parse_watchlist(filename):
                 # 统一转换为内部格式 sh.XXXXXX 或 sz.XXXXXX
                 code = raw_code.lower()
                 if code.startswith('sh.') or code.startswith('sz.'):
-                    pass                                       # 已经是内部格式
+                    pass
                 elif '.' in code:
                     code = code.replace('.sh', '.SH').replace('.sz', '.SZ')
                     if code.endswith('.SH'):
@@ -50,19 +47,15 @@ def parse_watchlist(filename):
 
 
 def diagnose_stock(code, name, df_daily, df_fin, target_date, yearly_data):
-    """
-    对单只股票进行完整策略诊断，返回 (是否通过, 信号描述, 失败原因)
-    """
-    # 0. 基础数据检查
+    """对单只股票进行完整策略诊断，返回 (是否通过, 信号描述, 失败原因)"""
     if code not in df_daily.index.get_level_values('code'):
         return False, '', '无日线数据'
 
     df_code = df_daily.loc[code].sort_index()
     recent_mask = df_code.index >= target_date - timedelta(days=40)
     if recent_mask.sum() < 18:
-        return False, '', f'近期停牌过多'
+        return False, '', '近期停牌过多'
 
-    # 1. 年线趋势 + 流动性
     if not st.check_annual_trend(code, df_daily, target_date, yearly_data):
         return False, '', '年线趋势不通过'
 
@@ -74,7 +67,6 @@ def diagnose_stock(code, name, df_daily, df_fin, target_date, yearly_data):
     if pd.isna(ma120) or ma120 < st.MIN_120D_AMOUNT:
         return False, '', f'120日均成交额不足 ({ma120:.0f}万)'
 
-    # 2. 技术信号计算
     df_code_w = df_code[['close', 'low']].resample('W').agg({'close':'last','low':'min'}).dropna()
     df_code_m = df_code[['close', 'low']].resample('ME').agg({'close':'last','low':'min'}).dropna()
     if len(df_code_w) < 20 or len(df_code_m) < 18:
@@ -102,13 +94,11 @@ def diagnose_stock(code, name, df_daily, df_fin, target_date, yearly_data):
     if not has_signal:
         return False, '', '无任何技术信号'
 
-    # 3. 财务检查（根据开关）
     if st.USE_FINANCIAL_FILTER:
         fin_codes = st.apply_financial_filter([code], df_fin, target_date)
         if not fin_codes:
             return False, '', '财务条件不满足'
 
-    # 4. 汇总信号描述
     signal_parts = []
     if w_retest_ok and w_bb_ok: signal_parts.append('周线回踩+周布林')
     elif w_retest_ok: signal_parts.append('周线回踩')
@@ -129,13 +119,12 @@ if __name__ == '__main__':
 
     conn = sqlite3.connect(st.DB_PATH)
     df_daily = st.load_all_data(conn)
-    df_fin   = st.load_financial_data(conn)
+    df_fin = st.load_financial_data(conn)
     basic = pd.read_sql("SELECT code, name FROM stock_basic", conn)
     conn.close()
 
     target_date = df_daily.index.get_level_values('date').max()
 
-    # 计算自然年聚合（用于年线判断）
     df_stocks = df_daily.copy()
     df_stocks['year'] = df_stocks.index.get_level_values('date').year
     yearly = df_stocks.groupby(['code', 'year']).agg(
@@ -151,19 +140,15 @@ if __name__ == '__main__':
         else:
             failed.append((code, display_name, reason))
 
-    # ★ 修复点：将 f-string 拆分为多行，避免解析错误
-    with open(REPORT_FILE, 'w', encoding='utf-8') as f:
-        f.write(f"自选股诊断报告（策略 v4.0）  日期：{target_date.strftime('%Y-%m-%d')}\n")
-        f.write("=" * 80 + "\n\n")
-        f.write(f"✅ 符合条件（共 {len(passed)} 只）\n")
-        f.write("-" * 40 + "\n")
+    # ★ 输出逗号分隔的 CSV 文件，股票代码去除前缀
+    with open(REPORT_FILE, 'w', encoding='utf-8-sig') as f:
+        f.write("状态,股票代码,名称,信号/原因\n")
         for code, name, sig in passed:
-            f.write(f"{code} {name}  信号: {sig}\n")
-
-        f.write(f"\n❌ 不符合条件（共 {len(failed)} 只）\n")
-        f.write("-" * 40 + "\n")
+            plain_code = code.replace('sh.', '').replace('sz.', '')
+            f.write(f"符合,{plain_code},{name},{sig}\n")
         for code, name, reason in failed:
-            f.write(f"{code} {name}  原因: {reason}\n")
+            plain_code = code.replace('sh.', '').replace('sz.', '')
+            f.write(f"不符合,{plain_code},{name},{reason}\n")
 
     print(f"\n诊断完成，报告已保存至 {REPORT_FILE}")
     print(f"符合: {len(passed)} 只，不符合: {len(failed)} 只")

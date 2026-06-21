@@ -16,9 +16,9 @@ SELECT * FROM daily;
 SELECT COUNT(*) FROM financial;
 SELECT COUNT(DISTINCT code) FROM financial;
 
-SELECT code, stat_date, net_profit_yoy, yoy_pni FROM financial WHERE code='sh.600519' ORDER BY stat_date DESC LIMIT 5;
+SELECT * FROM financial WHERE code='sh.600519' ORDER BY stat_date DESC LIMIT 5;
 
-SELECT * FROM financial;
+SELECT * FROM financial where express_gryoy is not null ;
 
 -- 连续两期净利润>0的股票数
 SELECT COUNT(*) FROM (
