@@ -22,7 +22,7 @@ FULL_START_DATE = '2018-01-01'
 REQUEST_MIN_DELAY = 0.1
 REQUEST_MAX_DELAY = 0.5
 INACTIVE_DAYS = 60
-MAX_RETRY = 1                 # 仅网络错误重试
+MAX_RETRY = 3                 # 网络 / API 错误重试次数
 SOCKET_TIMEOUT = 60
 
 def reconnect_baostock():
@@ -115,7 +115,7 @@ def download_one_baostock(code, name, start_date, end_date):
                 adjustflag="2"
             )
             if rs.error_code != '0':
-                return None, f"查询失败: {rs.error_msg}"
+                raise ConnectionError(f"查询失败: {rs.error_msg}")
             rows = []
             while rs.next():
                 rows.append(rs.get_row_data())
