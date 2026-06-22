@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-baostock 财务数据下载 —— v3.1
+baostock 财务数据下载 —— v3.2
 - 增量模式：python3 pipeline/financial_baostock.py   (自动跳过已有数据)
 - 全量模式：python3 pipeline/financial_baostock.py --full
 - 单线程顺序，请求间隔 0.1s
 - express 按 (code, year) 缓存
 - revenue_yoy：baostock 不提供单季度营收，置 NULL
+- 增量检测覆盖策略关键字段：yoy_pni + net_profit（gp_margin 排除，金融股无此指标）
 - 网络错误自动重连 + 重试（MAX_RETRY=3），baostock API 错误也走重试
 """
 
@@ -238,11 +239,13 @@ if __name__ == '__main__':
     else:
         min_date = f"{CURRENT_YEAR - 2}-01-01"
 
-        # 完整记录：核心字段都存在
+        # 完整记录：策略关键字段都存在（gp_margin 排除——金融股无此指标）
         rows = conn.execute("""
             SELECT code, stat_date FROM financial
             WHERE stat_date >= ?
               AND net_profit_yoy IS NOT NULL
+              AND yoy_pni IS NOT NULL
+              AND net_profit IS NOT NULL
         """, (min_date,)).fetchall()
 
         existing_by_code = {}
