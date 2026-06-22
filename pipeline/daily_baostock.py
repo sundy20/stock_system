@@ -13,6 +13,7 @@ import warnings
 import os, sys, time, sqlite3, pandas as pd, random, socket
 from datetime import datetime, timedelta
 import baostock as bs
+import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); from db import schema as db_schema
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 
@@ -23,9 +24,6 @@ REQUEST_MAX_DELAY = 0.5
 INACTIVE_DAYS = 60
 MAX_RETRY = 1                 # 仅网络错误重试
 SOCKET_TIMEOUT = 60
-
-DAILY_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'turn', 'pre_close']
-
 
 def reconnect_baostock():
     try:
@@ -41,19 +39,6 @@ def reconnect_baostock():
     socket.setdefaulttimeout(SOCKET_TIMEOUT)
 
 
-def init_db(conn):
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA cache_size = -20000;")
-    conn.execute('''CREATE TABLE IF NOT EXISTS daily (
-                                                         code TEXT, date TEXT, name TEXT,
-                                                         open REAL, high REAL, low REAL, close REAL,
-                                                         volume REAL, amount REAL, pct_chg REAL, turn REAL, pre_close REAL,
-                                                         PRIMARY KEY (code, date))''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS stock_basic (
-                                                               code TEXT PRIMARY KEY, name TEXT, industry TEXT, list_date TEXT)''')
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_code_date ON daily(code, date);")
-    conn.commit()
 
 
 def get_stock_list_baostock(conn):
@@ -148,7 +133,7 @@ def download_one_baostock(code, name, start_date, end_date):
             df['amount'] = df['amount'].astype(float)
             df['turn'] = df['turn'].astype(float)
             df['pre_close'] = df['preclose']
-            df = df[DAILY_COLUMNS]
+            df = df[[c for c in db_schema.DAILY_COLUMNS if c in df.columns and c not in ('code', 'name')]]
             df['code'] = code
             return df, None
 
@@ -161,22 +146,6 @@ def download_one_baostock(code, name, start_date, end_date):
     return None, "网络重试后仍失败"
 
 
-def safe_batch_write(conn, df_list):
-    if not df_list:
-        return
-    all_df = pd.concat(df_list, ignore_index=True)
-    for col in DAILY_COLUMNS + ['code']:
-        if col not in all_df.columns:
-            all_df[col] = None
-    all_df.to_sql('daily_temp', conn, if_exists='replace', index=False)
-    conn.execute('''
-        INSERT OR REPLACE INTO daily (code, date, name, open, high, low, close,
-                                      volume, amount, pct_chg, turn, pre_close)
-        SELECT code, date, name, open, high, low, close,
-               volume, amount, pct_chg, turn, pre_close FROM daily_temp
-    ''')
-    conn.execute("DROP TABLE IF EXISTS daily_temp")
-    conn.commit()
 
 
 if __name__ == '__main__':
@@ -191,7 +160,8 @@ if __name__ == '__main__':
     print("login success!")
 
     conn = sqlite3.connect(DB_PATH)
-    init_db(conn)
+    db_schema.init_all_tables(conn)
+    db_schema.init_db_pragmas(conn)
 
     stock_info = get_stock_list_baostock(conn)
     stock_info = pd.concat([stock_info, pd.DataFrame([{
@@ -242,7 +212,7 @@ if __name__ == '__main__':
             batch_buffer.append(df)
             success += 1
             if len(batch_buffer) >= 50:
-                safe_batch_write(conn, batch_buffer)
+                db_schema.safe_batch_write(conn, batch_buffer, 'daily', db_schema.DAILY_COLUMNS)
                 batch_buffer = []
                 print(f"  已完成 {success}/{len(task_list)} 只")
         else:

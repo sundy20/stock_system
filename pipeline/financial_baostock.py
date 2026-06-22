@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-baostock 财务数据下载——优化版（express缓存 + 批量SQL + 固定延迟）
+baostock 财务数据下载 —— v2.0（统一 schema + revenue_yoy 修复 + express 缓存）
 - 默认增量模式：仅补充缺失的季度数据（最近两年）
 - 全量模式：python3 download_financials.py --full  强制全量重新下载
 - 单线程顺序执行，请求间隔固定 0.1 秒
-- express report 按 (code, year) 缓存，同一年份多个季度共享，省 75% express 调用
-- 缺失季度批量 SQL 查询，一次取全部股票的既有数据
-- 仅对网络错误进行重试，确定性失败直接跳过
+- express report 按 (code, year) 缓存，省 75% express 调用
+- operation data 按 (code, year) 缓存，自动计算 revenue_yoy
+- 缺失季度批量 SQL 查询，一次取全部股票既有数据
+- 网络错误重试，确定性失败直接跳过
 - 断网重连等待 10~20 秒
-- 保存字段：成长能力 + 盈利能力 + 业绩快报
-- 失败股票输出到 failed_financial.txt，附带具体错误信息
+- 保存字段：成长能力 + 盈利能力 + 业绩快报 + 营收增长率
+- 失败股票输出到 failed_financial.txt
 """
 import warnings
 import baostock as bs
@@ -17,25 +18,16 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 import time, sys, socket, random
+import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); from db import schema as db_schema
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 
-DB_PATH = 'stocks_2y.db'
-REQUEST_DELAY = 0.1             # 固定请求间隔（秒），baostock 无公开限速，0.1s 安全
-MAX_RETRY = 1                   # 网络错误重试次数（仅网络问题）
+DB_PATH = db_schema.DB_PATH if hasattr(db_schema, 'DB_PATH') else 'stocks_2y.db'
+REQUEST_DELAY = 0.1             # 固定请求间隔（秒）
+MAX_RETRY = 1                   # 网络错误重试次数
 SOCKET_TIMEOUT = 180
 CURRENT_YEAR = datetime.now().year
 QUARTERS = [1, 2, 3, 4]
-
-# 需要写入 financial 表的所有列
-ALL_COLUMNS = [
-    'code', 'name', 'pub_date', 'stat_date',
-    'net_profit_yoy', 'revenue_yoy',
-    'yoy_equity', 'yoy_asset', 'yoy_eps', 'yoy_pni',
-    'net_profit', 'roe_avg', 'gp_margin',
-    'express_gryoy', 'express_opyoy',
-    'express_pub_date', 'express_stat_date'
-]
 
 
 def reconnect_baostock():
@@ -59,29 +51,9 @@ def get_mainboard_codes(conn):
     return list(zip(df['code'], df['name']))
 
 
-def init_db(conn):
-    """创建 financial 表（若不存在），包含全部字段"""
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute('''CREATE TABLE IF NOT EXISTS financial (
-                                                             code TEXT, name TEXT,
-                                                             pub_date TEXT, stat_date TEXT,
-                                                             net_profit_yoy REAL, revenue_yoy REAL,
-                                                             yoy_equity REAL, yoy_asset REAL, yoy_eps REAL, yoy_pni REAL,
-                                                             net_profit REAL, roe_avg REAL, gp_margin REAL,
-                                                             express_gryoy REAL, express_opyoy REAL,
-                                                             express_pub_date TEXT, express_stat_date TEXT,
-                                                             PRIMARY KEY (code, stat_date)
-        )''')
-    conn.commit()
-
-
 def is_quarter_available(year, quarter):
     """
     根据A股季报披露规则，判断该季度数据现在是否可能已发布。
-    Q1: 4月30日截止 → 5月5日起可查
-    Q2: 8月31日截止 → 9月5日起可查
-    Q3: 10月31日截止 → 11月5日起可查
-    Q4: 次年4月30日截止 → 次年5月5日起可查
     """
     if quarter == 1:
         deadline = pd.Timestamp(year=year, month=5, day=5)
@@ -95,17 +67,85 @@ def is_quarter_available(year, quarter):
 
 
 def _quarter_stat_date(year, quarter):
-    """将 (年, 季度) 映射为 stat_date 字符串，如 (2025,1) → '2025-03-31'"""
+    """将 (年, 季度) 映射为 stat_date 字符串"""
     month = quarter * 3
     day = 30 if month in (6, 9) else 31
     return f"{year}-{month:02d}-{day}"
 
 
-def download_single(code, name, year, quarter, express_cache):
+# ===================== 营收数据缓存（修复 revenue_yoy 永远 NULL） =====================
+
+def _ensure_operation_cache(code, year, op_cache):
+    """
+    确保 (code, year) 的营收数据在缓存中。
+    按季度查询，将累积营收转换为单季度营收。
+    返回 {1: Q1单季营收, 2: Q2单季营收, 3: Q3单季营收, 4: Q4单季营收}
+    """
+    cache_key = (code, year)
+    if cache_key in op_cache:
+        return op_cache[cache_key]
+
+    cum_revs = {}   # 累积营收 per quarter
+    for q in QUARTERS:
+        try:
+            rs = bs.query_operation_data(code, year=year, quarter=q)
+            if rs.error_code == '0':
+                rows = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                if rows:
+                    df = pd.DataFrame(rows, columns=rs.fields)
+                    # 尝试多个可能的营收字段名
+                    for rev_field in ['operrevenue', 'OperRevenue', 'operRev']:
+                        if rev_field in rs.fields:
+                            cum_revs[q] = pd.to_numeric(df[rev_field].iloc[0], errors='coerce')
+                            break
+        except:
+            pass
+        time.sleep(REQUEST_DELAY)
+
+    # 累积 → 单季度
+    single_q = {}
+    for q in QUARTERS:
+        if q == 1:
+            single_q[q] = cum_revs.get(1)
+        elif q in cum_revs and (q - 1) in cum_revs:
+            single_q[q] = cum_revs[q] - cum_revs[q - 1]
+        elif q in cum_revs:
+            single_q[q] = cum_revs.get(q)  # 仅有累积，无法拆分
+        else:
+            single_q[q] = None
+
+    op_cache[cache_key] = single_q
+    return single_q
+
+
+def _calc_revenue_yoy(code, year, quarter, op_cache):
+    """
+    计算营收同比增长率 = (本季 - 去年同季) / |去年同季| * 100。
+    返回 (yoy_value, None) 或 (None, error_msg)
+    """
+    try:
+        curr_revs = _ensure_operation_cache(code, year, op_cache)
+        last_revs = _ensure_operation_cache(code, year - 1, op_cache)
+        curr = curr_revs.get(quarter)
+        last = last_revs.get(quarter)
+        if curr is None or last is None:
+            return None
+        if last == 0:
+            return None
+        return round((curr - last) / abs(last) * 100, 2)
+    except Exception as e:
+        return None
+
+
+# ===================== 单股下载 =====================
+
+def download_single(code, name, year, quarter, express_cache, op_cache):
     """
     下载单只股票指定季度的财务数据。
-    网络错误会重试，其他错误直接返回。
-    express_cache: {(code, year): DataFrame}，缓存 express report 查询结果
+    express_cache: {(code, year): DataFrame}   express report 缓存
+    op_cache:      {(code, year): {q: revenue}} 营收数据缓存
     """
     time.sleep(REQUEST_DELAY)
 
@@ -183,7 +223,7 @@ def download_single(code, name, year, quarter, express_cache):
                             express_df = pd.DataFrame(rows, columns=rs_express.fields)
                 except:
                     pass
-                express_cache[cache_key] = express_df   # None 也缓存，避免重复失败调用
+                express_cache[cache_key] = express_df
 
             if express_df is not None and not express_df.empty:
                 target_end = _quarter_stat_date(year, quarter)
@@ -199,12 +239,15 @@ def download_single(code, name, year, quarter, express_cache):
                     express_data['express_pub_date'] = latest.get('performanceExpPubDate', '')
                     express_data['express_stat_date'] = latest.get('performanceExpStatDate', '')
 
+            # 4. ★ 营收增长率（v2.0 修复：从 operation_data 获取）
+            revenue_yoy = _calc_revenue_yoy(code, year, quarter, op_cache)
+
             record = {
                 'code': code, 'name': name,
                 'pub_date': growth_data.get('pub_date', ''),
                 'stat_date': growth_data.get('stat_date', _quarter_stat_date(year, quarter)),
                 'net_profit_yoy': growth_data.get('net_profit_yoy'),
-                'revenue_yoy': None,
+                'revenue_yoy': revenue_yoy,                     # ★ 修复
                 'yoy_equity': growth_data.get('yoy_equity'),
                 'yoy_asset': growth_data.get('yoy_asset'),
                 'yoy_eps': growth_data.get('yoy_eps'),
@@ -228,37 +271,7 @@ def download_single(code, name, year, quarter, express_cache):
     return None, "网络重试后仍失败"
 
 
-def batch_write_safe(conn, df_list):
-    """临时表 + INSERT OR REPLACE 批量写入（自动补齐缺失列）"""
-    if not df_list:
-        return
-    all_df = pd.concat(df_list, ignore_index=True)
-    for col in ALL_COLUMNS:
-        if col not in all_df.columns:
-            all_df[col] = None
-    all_df = all_df[ALL_COLUMNS]
-    all_df.to_sql('financial_temp', conn, if_exists='replace', index=False)
-    conn.execute('''
-        INSERT OR REPLACE INTO financial (
-            code, name, pub_date, stat_date,
-            net_profit_yoy, revenue_yoy,
-            yoy_equity, yoy_asset, yoy_eps, yoy_pni,
-            net_profit, roe_avg, gp_margin,
-            express_gryoy, express_opyoy,
-            express_pub_date, express_stat_date
-        )
-        SELECT
-            code, name, pub_date, stat_date,
-            net_profit_yoy, revenue_yoy,
-            yoy_equity, yoy_asset, yoy_eps, yoy_pni,
-            net_profit, roe_avg, gp_margin,
-            express_gryoy, express_opyoy,
-            express_pub_date, express_stat_date
-        FROM financial_temp
-    ''')
-    conn.execute("DROP TABLE IF EXISTS financial_temp")
-    conn.commit()
-
+# ===================== 主流程 =====================
 
 if __name__ == '__main__':
     full_mode = '--full' in sys.argv
@@ -272,7 +285,8 @@ if __name__ == '__main__':
     print("login success!")
 
     conn = sqlite3.connect(DB_PATH)
-    init_db(conn)
+    db_schema.init_all_tables(conn)
+    db_schema.init_db_pragmas(conn)
 
     codes = get_mainboard_codes(conn)
     total = len(codes)
@@ -288,7 +302,6 @@ if __name__ == '__main__':
                     if is_quarter_available(y, q):
                         tasks.append((code, name, y, q))
     else:
-        # 批量 SQL：一次查询全部股票的既有 stat_date
         min_date = f"{CURRENT_YEAR-2}-01-01"
         rows = conn.execute("""
             SELECT code, stat_date FROM financial
@@ -320,23 +333,25 @@ if __name__ == '__main__':
         conn.close()
         sys.exit(0)
 
-    print(f"请求间隔固定 {REQUEST_DELAY:.1f} 秒，express 按 (code, year) 缓存（同一年份只查1次）")
-    print(f"预计耗时 {len(tasks) * REQUEST_DELAY / 60:.1f} 分钟（不含 API 响应时间）")
+    print(f"请求间隔固定 {REQUEST_DELAY:.1f} 秒，"
+          f"express 按 (code, year) 缓存，operation 按 (code, year) 缓存")
+    print(f"预计耗时约 {len(tasks) * REQUEST_DELAY / 60:.1f} 分钟（不含 API 响应）")
 
     success = 0
     failed_stocks = {}
     batch_buffer = []
-    express_cache = {}         # {(code, year): DataFrame | None}
+    express_cache = {}
+    op_cache = {}              # ★ 营收数据缓存
     start_time = time.time()
 
     for idx, (code, name, year, quarter) in enumerate(tasks):
-        df, err_msg = download_single(code, name, year, quarter, express_cache)
+        df, err_msg = download_single(code, name, year, quarter, express_cache, op_cache)
 
         if df is not None:
             batch_buffer.append(df)
             success += 1
             if len(batch_buffer) >= 50:
-                batch_write_safe(conn, batch_buffer)
+                db_schema.safe_batch_write(conn, batch_buffer, 'financial', db_schema.FINANCIAL_COLUMNS)
                 batch_buffer = []
                 print(f"  已完成 {success}/{len(tasks)} 个季度")
         else:
@@ -346,10 +361,12 @@ if __name__ == '__main__':
         if (idx + 1) % 200 == 0:
             elapsed = time.time() - start_time
             print(f"  已处理 {idx+1}/{len(tasks)}，已用时 {elapsed/60:.1f} 分钟，"
-                  f"express缓存命中 {sum(1 for v in express_cache.values() if v is not None)} 次")
+                  f"express缓存命中 {sum(1 for v in express_cache.values() if v is not None)} 次，"
+                  f"op缓存 {len(op_cache)} 年")
 
     if batch_buffer:
-        batch_write_safe(conn, batch_buffer)
+        db_schema.safe_batch_write(conn, batch_buffer, 'financial', db_schema.FINANCIAL_COLUMNS)
+    db_schema.checkpoint_db(conn)
     conn.commit()
     conn.close()
 

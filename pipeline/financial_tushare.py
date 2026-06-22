@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-tushare 财务数据下载——增量更新，面向主力数据源设计
+tushare 财务数据下载 —— v2.0（补齐字段 + 统一 schema）
 - 动态日期：自动计算当前年和去年
 - 增量模式：仅补充数据库中缺失的季度数据
 - 全量模式：python3 download_financial_tushare.py --full
 - 限速 50 次/分钟，失败重试 2 次
 - 表结构与 baostock 版兼容，backtest 脚本可直接切换使用
+- v2.0: 补齐 net_profit/roe_avg/gp_margin 字段；清理死代码
 """
 import os, sys, time, sqlite3, pandas as pd
 from datetime import datetime
 import tushare as ts
+import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); from db import schema as db_schema
 
 TOKEN = os.getenv('TUSHARE_TOKEN')
 if not TOKEN:
@@ -22,19 +24,6 @@ CALL_PER_MIN = 50
 SLEEP_SEC = 60 / CALL_PER_MIN
 CURRENT_YEAR = datetime.now().year
 QUARTERS = [1, 2, 3, 4]
-
-
-def init_db(conn):
-    """创建 financial 表（与 baostock 版表结构完全兼容）"""
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute('''CREATE TABLE IF NOT EXISTS financial (
-        code TEXT, name TEXT,
-        pub_date TEXT, stat_date TEXT,
-        net_profit_yoy REAL, revenue_yoy REAL,
-        yoy_equity REAL, yoy_asset REAL, yoy_eps REAL, yoy_pni REAL,
-        PRIMARY KEY (code, stat_date)
-    )''')
-    conn.commit()
 
 
 def get_stock_codes(conn):
@@ -58,14 +47,7 @@ def get_missing_quarters(conn, code):
     missing = []
     for year in [CURRENT_YEAR - 1, CURRENT_YEAR]:
         for quarter in QUARTERS:
-            if quarter == 1:
-                sd = f"{year}-03-31"
-            elif quarter == 2:
-                sd = f"{year}-06-30"
-            elif quarter == 3:
-                sd = f"{year}-09-30"
-            else:
-                sd = f"{year}-12-31"
+            sd = f"{year}-{quarter * 3:02d}-{['31','30','30','31'][quarter-1]}"
             if sd not in existing or not existing[sd]:
                 missing.append((year, quarter, sd))
     return missing
@@ -73,81 +55,88 @@ def get_missing_quarters(conn, code):
 
 def download_one(code, name, year, quarter):
     """
-    下载单只股票指定季度的财务数据
-    返回 (DataFrame_or_None, error_msg)
+    下载单只股票指定季度的财务数据。
+    使用 pro.fina_indicator（主）+ pro.income（补充净利润）。
     """
     ts_code = code[3:] + '.SH' if code.startswith('sh.') else code[3:] + '.SZ'
-    period = f"{year}{quarter:02d}01" if quarter == 1 else f"{year}{quarter * 3:02d}01"
-    # tushare period 格式: 20240331, 20240630, 20240930, 20241231
-    period = f"{year}{quarter * 3:02d}{['31','30','30','31'][quarter-1]}"
+    stat_date = f"{year}-{quarter * 3:02d}-{['31','30','30','31'][quarter-1]}"
+    period = stat_date.replace('-', '')  # 20240331
 
     try:
+        # 1. 财务指标（主接口：成长性）
         df = pro.fina_indicator(
-            ts_code=ts_code,
-            period=period,
-            fields='ts_code,ann_date,end_date,q_profit_yoy,q_gr_yoy,q_fa_yoygr'
+            ts_code=ts_code, period=period,
+            fields='ts_code,ann_date,end_date,'
+                   'q_profit_yoy,q_gr_yoy,q_fa_yoygr,'        # 成长性
+                   'roe,roe_yearly,gp_margin,'                 # ★ v2.0 补齐：盈利能力
+                   'profit_dedt'                                # ★ 扣非净利润
         )
-        if df.empty:
-            return None, "无数据返回"
-        if len(df) == 0:
-            return None, "空 DataFrame"
-
-        # 字段映射
-        col_map = {
-            'q_profit_yoy': 'net_profit_yoy',
-            'q_gr_yoy': 'revenue_yoy',
-            'q_fa_yoygr': 'yoy_equity',
-        }
-        for orig, target in col_map.items():
-            if orig in df.columns:
-                df[target] = pd.to_numeric(df[orig], errors='coerce')
-
-        stat_date = str(pd.to_datetime(df['end_date'].iloc[0]).date())
-        pub_date = str(pd.to_datetime(df['ann_date'].iloc[0]).date()) if 'ann_date' in df.columns else ''
+        if df is None or df.empty:
+            return None, "fina_indicator 无数据返回"
 
         record = {
             'code': code,
             'name': name,
-            'pub_date': pub_date,
+            'pub_date': str(pd.to_datetime(df['ann_date'].iloc[0]).date()) if 'ann_date' in df.columns else '',
             'stat_date': stat_date,
-            'net_profit_yoy': df['net_profit_yoy'].iloc[0] if 'net_profit_yoy' in df.columns else None,
-            'revenue_yoy': df['revenue_yoy'].iloc[0] if 'revenue_yoy' in df.columns else None,
-            'yoy_equity': df['yoy_equity'].iloc[0] if 'yoy_equity' in df.columns else None,
-            'yoy_asset': None,  # tushare 无直接对应字段
+            'net_profit_yoy': _safe_float(df, 'q_profit_yoy'),
+            'revenue_yoy': _safe_float(df, 'q_gr_yoy'),
+            'yoy_equity': _safe_float(df, 'q_fa_yoygr'),
+            'yoy_asset': None,
             'yoy_eps': None,
-            'yoy_pni': None,
+            'yoy_pni': _safe_float(df, 'profit_dedt'),
+            'net_profit': None,     # 需要通过 income 接口获取
+            'roe_avg': _safe_float(df, 'roe_yearly') or _safe_float(df, 'roe'),
+            'gp_margin': _safe_float(df, 'gp_margin'),
+            'express_gryoy': None,
+            'express_opyoy': None,
+            'express_pub_date': '',
+            'express_stat_date': '',
         }
+
+        # 2. 利润表（补充净利润）
+        try:
+            df_inc = pro.income(
+                ts_code=ts_code, period=period,
+                fields='ts_code,end_date,n_income,n_income_attr_p'
+            )
+            if df_inc is not None and not df_inc.empty:
+                record['net_profit'] = _safe_float(df_inc, 'n_income_attr_p') or _safe_float(df_inc, 'n_income')
+                # 用利润表的 end_date 覆盖（有时与 fina_indicator 不同）
+                if 'end_date' in df_inc.columns and not pd.isna(df_inc['end_date'].iloc[0]):
+                    record['stat_date'] = str(pd.to_datetime(df_inc['end_date'].iloc[0]).date())
+        except Exception:
+            pass  # income 接口可能积分不足，静默跳过
+
         return pd.DataFrame([record]), None
 
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
 
 
-def batch_write_safe(conn, df_list):
-    """临时表 + INSERT OR REPLACE 批量写入"""
-    if not df_list:
-        return
-    all_df = pd.concat(df_list, ignore_index=True)
-    all_df.to_sql('financial_temp', conn, if_exists='replace', index=False)
-    conn.execute('''
-        INSERT OR REPLACE INTO financial (code, name, pub_date, stat_date,
-                                          net_profit_yoy, revenue_yoy,
-                                          yoy_equity, yoy_asset, yoy_eps, yoy_pni)
-        SELECT code, name, pub_date, stat_date,
-               net_profit_yoy, revenue_yoy,
-               yoy_equity, yoy_asset, yoy_eps, yoy_pni FROM financial_temp
-    ''')
-    conn.execute("DROP TABLE IF EXISTS financial_temp")
-    conn.commit()
+def _safe_float(df, col):
+    """安全取 DataFrame 第一行的 float 值"""
+    if df is None or col not in df.columns:
+        return None
+    try:
+        val = df[col].iloc[0]
+        if pd.isna(val):
+            return None
+        return float(val)
+    except (ValueError, TypeError):
+        return None
 
+
+# ===================== 主流程 =====================
 
 if __name__ == '__main__':
     full_mode = '--full' in sys.argv
     mode_str = '全量重新下载' if full_mode else '增量更新'
-    print(f"tushare 财务数据下载：{mode_str}（{CURRENT_YEAR - 1}~{CURRENT_YEAR}）")
+    print(f"tushare 财务数据下载 v2.0：{mode_str}（{CURRENT_YEAR - 1}~{CURRENT_YEAR}）")
 
     conn = sqlite3.connect(DB_PATH)
-    init_db(conn)
+    db_schema.init_all_tables(conn)
+    db_schema.init_db_pragmas(conn)
     codes = get_stock_codes(conn)
 
     # 筛选需要更新的股票
@@ -187,7 +176,7 @@ if __name__ == '__main__':
             batch_buffer.append(df)
             success += 1
             if len(batch_buffer) >= 50:
-                batch_write_safe(conn, batch_buffer)
+                db_schema.safe_batch_write(conn, batch_buffer, 'financial', db_schema.FINANCIAL_COLUMNS)
                 batch_buffer = []
                 print(f"  已完成 {success}/{len(tasks)} 个季度")
         else:
@@ -199,7 +188,7 @@ if __name__ == '__main__':
             print(f"  已处理 {success + len(failed_stocks)}/{len(tasks)}")
 
     if batch_buffer:
-        batch_write_safe(conn, batch_buffer)
+        db_schema.safe_batch_write(conn, batch_buffer, 'financial', db_schema.FINANCIAL_COLUMNS)
 
     conn.close()
     print(f"\n下载完成，成功 {success}/{len(tasks)} 个季度")

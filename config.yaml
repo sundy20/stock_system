@@ -1,0 +1,72 @@
+# ==================== 股票量化系统 全局配置 ====================
+# 修改策略参数只需编辑此文件，无需改动 Python 源码。
+# 如果此文件不存在，系统自动使用内置默认值。
+
+# --- 数据库 ---
+database:
+  path: stocks_2y.db
+  backup_before_update: true
+  max_backups: 5
+
+# --- 选股策略参数 ---
+strategy:
+  benchmark: sh.000300        # 基准指数
+
+  liquidity:                  # 流动性过滤
+    min_20d_amount: 2000      # 20日均成交额 ≥ 2000万元
+    min_120d_amount: 1500    # 120日均成交额 ≥ 1500万元
+
+  annual_trend:                # 年度趋势
+    rolling_days: 250           # 滚动周期（≈12个月）
+    rolling_price_up: 0.15     # 滚动涨幅 ≥ 15%
+    rolling_vol_up: 0.30       # 滚动日均成交额增长 ≥ 30%
+    ma_slope_threshold: 0      # 年线斜率 ≥ 0（走平或向上）
+
+  monthly_retest:               # 月线回踩
+    down_tolerance: 0.12        # 下探幅度 ≤ 12%
+    near_tolerance: 0.08        # 靠近幅度 ≤ 8%
+    window: 18                  # 观察窗口（根月K线）
+    min_gap: 3                  # 两次回踩最小间隔（根）
+    min_touches: 1              # 最少回踩次数
+
+  weekly_retest:                # 周线回踩（二次回踩确认）
+    down_tolerance: 0.12
+    near_tolerance: 0.08
+    window: 50
+    min_gap: 5
+    min_touches: 2              # ★ 二次回踩确认
+
+  bollinger:                    # 布林带扩张
+    period: 20                  # 布林带周期
+    std_mult: 2                 # 标准差倍数
+    short_ma: 5                 # 带宽短期均线周期
+    long_ma: 20                 # 带宽长期均线周期
+    short_dir_period: 2         # 标准模式连续上升期数
+    mid_dir_period: 3           # 中轨方向计算周期
+    monthly_require_mid_up: false   # 月线布林不要求中轨方向
+    weekly_require_mid_up: true     # 周线布林要求中轨走平或向上
+    weekly_pre_expand: true         # 启用收缩预警
+    weekly_contraction_ratio: 0.9   # 收缩阈值
+    weekly_dual_mode: true          # 双模式：标准扩张 + 收缩预警并行
+
+  financial_filter:              # 财务筛选
+    enabled: true                # 设为 false 关闭财务筛选（纯技术面选股）
+    consec_quarters: 2           # 连续季度数
+    min_profit_yoy: 0.0          # 归母净利润同比 > 0%
+    min_pni_yoy: 0.0             # 扣非净利润同比 > 0%
+    min_net_profit: 10000000     # 单季度净利润 ≥ 1000万元
+
+# --- 回测参数 ---
+backtest:
+  init_cash: 1000000          # 初始资金
+  max_stocks: 200             # 最大持仓数
+  lookback_years: 2           # 回测回溯年数
+  rebalance_freq: W           # 调仓频率：W=周, M=月
+  commission: 0.0001          # 佣金（万1）
+  slippage: 0.001             # 滑点
+  stamp_duty: 0.001           # 卖出印花税
+
+# --- 预计算缓存 ---
+cache:
+  enabled: true               # 是否启用预计算缓存（调试时可关闭）
+  file: .signal_cache.pkl     # 缓存文件路径
