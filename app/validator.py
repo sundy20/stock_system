@@ -95,8 +95,10 @@ def check_cross_table(conn):
     diff = basic_count - daily_count
     if diff > 0:
         print(f"⚠ {diff} 只股票在 stock_basic 中但 daily 无数据")
+    elif diff < 0:
+        print(f"⚠ {-diff} 只股票在 daily 中有数据但 stock_basic 无记录（可能是已退市股或基准指数）")
     else:
-        print("✓ 一致")
+        print("✓ 两表股票数一致")
     no_fin = pd.read_sql("""
         SELECT COUNT(*) as cnt FROM stock_basic
         WHERE code NOT IN (SELECT DISTINCT code FROM financial) AND code != 'sh.000300'
