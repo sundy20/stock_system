@@ -13,7 +13,7 @@ import warnings
 import os, sys, time, sqlite3, pandas as pd, random, socket
 from datetime import datetime, timedelta
 import baostock as bs
-import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); from db import schema as db_schema
+import sys, os as _sos; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); from db import schema as db_schema
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 

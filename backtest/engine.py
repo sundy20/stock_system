@@ -1,8 +1,10 @@
 """
-回测引擎 — 选股 + 周度调仓 + 净值计算
-
-从 backtest_twice_retest.py 拆分出来的核心回测逻辑。
+回测引擎 — 选股 + 月/周度调仓 + 净值计算
 """
+
+import warnings
+warnings.filterwarnings('ignore', message=".*'M' is deprecated.*")
+warnings.filterwarnings('ignore', message=".*'W' is deprecated.*")
 
 import pandas as pd
 import numpy as np

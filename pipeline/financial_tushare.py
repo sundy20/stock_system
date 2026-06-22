@@ -11,7 +11,7 @@ tushare 财务数据下载 —— v2.0（补齐字段 + 统一 schema）
 import os, sys, time, sqlite3, pandas as pd
 from datetime import datetime
 import tushare as ts
-import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); from db import schema as db_schema
+import sys, os as _sos; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); from db import schema as db_schema
 
 TOKEN = os.getenv('TUSHARE_TOKEN')
 if not TOKEN:

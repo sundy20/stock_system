@@ -12,6 +12,10 @@ v4.2 改进：
   - 预计算磁盘缓存
 """
 
+import warnings
+warnings.filterwarnings('ignore', message=".*'M' is deprecated.*")
+warnings.filterwarnings('ignore', message=".*'W' is deprecated.*")
+
 import sqlite3
 import pandas as pd
 import numpy as np

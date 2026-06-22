@@ -22,7 +22,7 @@ import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspa
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 
-DB_PATH = db_schema.DB_PATH if hasattr(db_schema, 'DB_PATH') else 'stocks_2y.db'
+DB_PATH = 'stocks_2y.db'   # 可被 config.yaml database.path 覆盖
 REQUEST_DELAY = 0.1             # 固定请求间隔（秒）
 MAX_RETRY = 1                   # 网络错误重试次数
 SOCKET_TIMEOUT = 180
