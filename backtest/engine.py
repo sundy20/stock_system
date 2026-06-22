@@ -129,14 +129,15 @@ def select_stocks_at_date(signal_cache, yearly, df_daily, df_fin, basic_df,
 
 def run_backtest_optimized(signal_cache, yearly, df_daily, df_fin, basic_df,
                            name_map, industry_map, start, end,
-                           init_cash=1_000_000, max_stocks=200, bench_code=None):
-    """执行周度调仓回测（预计算信号 + 向量化净值）。返回 (perf, bench_ret, net_value)"""
+                           init_cash=1_000_000, max_stocks=200, bench_code=None,
+                           stop_loss_enabled=True, stop_loss_pct=-10.0):
+    """执行月/周度调仓回测。v4.2: 支持日内止损"""
     bench_code = bench_code or st.BENCH_CODE
     close = df_daily['close'].unstack(level='code').loc[start:end].dropna(axis=1, how='all')
     bench = close[bench_code] if bench_code in close.columns else None
     stock_close = close[[c for c in close.columns if c != bench_code]].ffill()
 
-    freq = 'W' if st.REBALANCE_FREQ == 'W' else 'ME'
+    freq = 'W' if st.REBALANCE_FREQ == 'W' else 'M'
     periods = stock_close.index.to_period(freq)
     rebalance_dates = stock_close.groupby(periods).apply(lambda x: x.index[-1]).values
 
@@ -154,6 +155,8 @@ def run_backtest_optimized(signal_cache, yearly, df_daily, df_fin, basic_df,
 
     signal_positions = {}
     signal_stats = {}
+    stop_loss_count = 0           # v4.2: 止损触发次数
+    total_stop_loss_amount = 0.0  # v4.2: 止损总金额
 
     logger.info("开始回测，共 %s 个调仓日", len(rebalance_dates))
 
@@ -176,19 +179,51 @@ def run_backtest_optimized(signal_cache, yearly, df_daily, df_fin, basic_df,
             limit_up_mask = pd.Series(False, dtype=bool)
             limit_down_mask = pd.Series(False, dtype=bool)
 
-        # 调仓间每日净值
+        # ★ v4.2: 调仓间每日净值 + 止损检查
         if last_date is not None:
             inter_mask = (stock_close.index > last_date) & (stock_close.index < d)
             inter_days = stock_close.index[inter_mask]
-            if len(inter_days) > 0 and holdings:
-                h = pd.Series(0.0, index=stock_close.columns)
-                for c, s in holdings.items():
-                    if c in h.index:
-                        h[c] = float(s)
-                portfolio = (h * stock_close.loc[inter_days]).sum(axis=1) + cash
-                net_vals.extend(zip(inter_days, portfolio.values))
-            elif len(inter_days) > 0:
-                net_vals.extend((day, cash) for day in inter_days)
+
+            for day in inter_days:
+                # 止损检查
+                if stop_loss_enabled and holdings:
+                    for c in list(holdings.keys()):
+                        if c not in stock_close.columns or c not in signal_positions:
+                            continue
+                        if pd.isna(stock_close.loc[day, c]):
+                            continue
+                        current_price = stock_close.loc[day, c]
+                        _, buy_price, sig_label = signal_positions[c]
+                        pnl_pct = (current_price / buy_price - 1) * 100
+                        if pnl_pct <= stop_loss_pct:
+                            # 执行止损卖出
+                            shares = holdings.pop(c)
+                            sell_amount = shares * current_price
+                            commission = max(sell_amount * st.COMMISSION, 5.0)
+                            stamp = sell_amount * st.STAMP_DUTY
+                            cash += sell_amount - commission - stamp
+                            total_commission += commission
+                            total_stamp_duty += stamp
+                            total_turnover += sell_amount
+                            stop_loss_count += 1
+                            total_stop_loss_amount += sell_amount
+                            # 记录信号归因
+                            ret_pct = pnl_pct
+                            if sig_label not in signal_stats:
+                                signal_stats[sig_label] = {'count': 0, 'total_return': 0.0, 'wins': 0}
+                            signal_stats[sig_label]['count'] += 1
+                            signal_stats[sig_label]['total_return'] += ret_pct
+                            del signal_positions[c]
+
+                # 当日净值
+                if holdings:
+                    val = float(sum(
+                        holdings[c] * stock_close.loc[day, c]
+                        for c in holdings if c in stock_close.columns and not pd.isna(stock_close.loc[day, c])
+                    ) + cash)
+                else:
+                    val = cash
+                net_vals.append((day, val))
 
         # 卖出全部
         for c in list(holdings.keys()):
@@ -295,6 +330,8 @@ def run_backtest_optimized(signal_cache, yearly, df_daily, df_fin, basic_df,
     perf['cost_ratio'] = (perf['total_cost'] / total_turnover * 100) if total_turnover > 0 else 0
     perf['avg_trades_per_rebalance'] = total_turnover / len(rebalance_dates) if len(rebalance_dates) > 0 else 0
     perf['signal_stats'] = signal_stats
+    perf['stop_loss_count'] = stop_loss_count
+    perf['total_stop_loss_amount'] = total_stop_loss_amount
 
     export_signal_attribution(signal_stats)
     return perf, bench_ret, net_value

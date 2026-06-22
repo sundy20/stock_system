@@ -77,6 +77,7 @@ FIN_CONSEC = 2
 MIN_PROFIT_YOY = 0.0
 MIN_PNI_YOY = 0.0
 MIN_NET_PROFIT = 10000000
+PROFIT_ACCELERATION = True    # 盈利加速度：最新季度增速 ≥ 前一季度
 
 COMMISSION = 0.0001
 SLIPPAGE = 0.001
@@ -162,7 +163,8 @@ def _load_config():
         fin = stg.get('financial_filter', {})
         for k, g in [('enabled', 'USE_FINANCIAL_FILTER'), ('consec_quarters', 'FIN_CONSEC'),
                      ('min_profit_yoy', 'MIN_PROFIT_YOY'), ('min_pni_yoy', 'MIN_PNI_YOY'),
-                     ('min_net_profit', 'MIN_NET_PROFIT')]:
+                     ('min_net_profit', 'MIN_NET_PROFIT'),
+                     ('profit_acceleration', 'PROFIT_ACCELERATION')]:
             if k in fin: globals()[g] = fin[k]
 
     bt = cfg.get('backtest', {})
@@ -312,14 +314,28 @@ def apply_financial_filter(fin_codes_base, df_fin, target_date):
         return []
 
     fin_latest = fin_before.sort_values('effective_date').groupby('code').tail(FIN_CONSEC)
-    fin_pass = fin_latest.groupby('code').filter(
-        lambda x: (len(x) == FIN_CONSEC) and
-                  all(x['net_profit_yoy'] > MIN_PROFIT_YOY) and
-                  all((x['yoy_pni'].isna()) | (x['yoy_pni'] > MIN_PNI_YOY)) and
-                  all((x['net_profit'].isna()) | (x['net_profit'] >= MIN_NET_PROFIT)) and
-                  all((x['roe_avg'].isna()) | (x['roe_avg'] > 0)) and
-                  all((x['gp_margin'].isna()) | (x['gp_margin'] > 0))
-    )
+
+    def _filter_func(x):
+        if len(x) != FIN_CONSEC:
+            return False
+        if not all(x['net_profit_yoy'] > MIN_PROFIT_YOY):
+            return False
+        if not all((x['yoy_pni'].isna()) | (x['yoy_pni'] > MIN_PNI_YOY)):
+            return False
+        if not all((x['net_profit'].isna()) | (x['net_profit'] >= MIN_NET_PROFIT)):
+            return False
+        if not all((x['roe_avg'].isna()) | (x['roe_avg'] > 0)):
+            return False
+        if not all((x['gp_margin'].isna()) | (x['gp_margin'] > 0)):
+            return False
+        # ★ 盈利加速度：最新季度增速 ≥ 前一季度
+        if PROFIT_ACCELERATION and FIN_CONSEC >= 2:
+            profits = x.sort_values('stat_date')['net_profit_yoy'].dropna().values
+            if len(profits) >= 2 and profits[-1] < profits[-2]:
+                return False
+        return True
+
+    fin_pass = fin_latest.groupby('code').filter(_filter_func)
     return fin_pass['code'].unique().tolist()
 
 
@@ -500,7 +516,7 @@ def precompute_all_signals_once(df_daily):
 
             # 周/月 resample + 信号
             df_w = df_code[['close', 'low']].resample('W').agg({'close': 'last', 'low': 'min'}).dropna()
-            df_m = df_code[['close', 'low']].resample('ME').agg({'close': 'last', 'low': 'min'}).dropna()
+            df_m = df_code[['close', 'low']].resample('M').agg({'close': 'last', 'low': 'min'}).dropna()
 
             w_retest = m_retest = w_bb = m_bb = None
             if len(df_w) >= 20 and len(df_m) >= 18:

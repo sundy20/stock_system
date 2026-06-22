@@ -224,7 +224,7 @@ if __name__ == '__main__':
             print(f"  已处理 {idx+1}/{len(task_list)}，已用时 {elapsed/60:.1f} 分钟")
 
     if batch_buffer:
-        safe_batch_write(conn, batch_buffer)
+        db_schema.safe_batch_write(conn, batch_buffer, 'daily', db_schema.DAILY_COLUMNS)
     conn.commit()
     conn.close()
 

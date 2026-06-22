@@ -220,7 +220,7 @@ if __name__ == '__main__':
             print(f"  已处理 {success+len(failed_list)}/{len(task_list)}")
 
     if batch:
-        safe_batch_write(conn, batch)
+        db_schema.safe_batch_write(conn, batch, 'daily', db_schema.DAILY_COLUMNS)
 
     conn.close()
     print(f"\n下载完成，成功 {success}/{len(task_list)} 只")
