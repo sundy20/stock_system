@@ -362,7 +362,7 @@ if __name__ == '__main__':
             elapsed = time.time() - start_time
             print(f"  已处理 {idx+1}/{len(tasks)}，已用时 {elapsed/60:.1f} 分钟，"
                   f"express缓存命中 {sum(1 for v in express_cache.values() if v is not None)} 次，"
-                  f"op缓存 {len(op_cache)} 年")
+                  f"op缓存 {len(op_cache)} 条(股×年)")
 
     if batch_buffer:
         db_schema.safe_batch_write(conn, batch_buffer, 'financial', db_schema.FINANCIAL_COLUMNS)
