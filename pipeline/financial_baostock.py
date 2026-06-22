@@ -87,6 +87,8 @@ def _ensure_operation_cache(code, year, op_cache):
 
     cum_revs = {}   # 累积营收 per quarter
     for q in QUARTERS:
+        if not is_quarter_available(year, q):
+            continue  # ★ 跳过未公布季度的空查询
         try:
             rs = bs.query_operation_data(code, year=year, quarter=q)
             if rs.error_code == '0':
