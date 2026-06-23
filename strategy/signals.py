@@ -16,13 +16,14 @@ MA_DIR_PERIOD = 3  # 默认值，会被 strategy 模块覆盖
 def detect_retest_with_gap(price_df, ma_period, tolerance_down, tolerance_near,
                            window, min_gap, min_touches=1, require_ma_up=True):
     """
-    均线回踩信号检测（v4.1 — min_gap 参数已修复生效）
+    均线回踩信号检测。
 
-    参数：
-        min_gap:      两次有效回踩事件之间的最小间隔（根K线）
-        min_touches:  最少回踩次数（月线1次，周线2次）
-        require_ma_up: 是否要求均线方向向上
-    返回布尔Series
+    回踩定义：价格在MA附近（下探≤tolerance_down 或 靠近≤tolerance_near）
+               且均线方向向上，且当前收盘价站上均线。
+    min_gap 保证两次回踩之间有足够间隔，避免密集毛刺。
+    min_touches：月线1次即可，周线需要2次（二次回踩确认）。
+
+    返回：布尔Series，True表示当天触发信号。
     """
     close = price_df['close']
     low   = price_df['low']
@@ -72,13 +73,14 @@ def detect_bb_expand(price_df, period=20, std_mult=2, short_ma=5, long_ma=20,
                      overbought_limit=None, pre_expand=False, contraction_ratio=0.9,
                      use_dual_mode=False, price_limit=None):
     """
-    布林带扩张检测（v3.1 双模式）
-    参数：
-        require_mid_up: 是否要求中轨方向向上（或走平）
-        pre_expand: 是否启用收缩预警模式
-        contraction_ratio: 收缩阈值，短期带宽 < 长期带宽 × 该值
-        use_dual_mode: 是否使用双模式（标准+收缩预警并行）
-        price_limit: 高位过滤
+    布林带扩张信号检测。
+
+    两种模式（use_dual_mode=True 时二者取或）：
+      A. 标准扩张：短期带宽均值 > 长期带宽均值，且短期带宽连续上升
+      B. 收缩预警：带宽收缩到基线以下后开始反弹（pre_expand=True 启用）
+
+    月线布林：require_mid_up=False（周期长，容忍中轨短暂下行）
+    周线布林：require_mid_up=True + 双模式（标准扩张+收缩预警并行）
     """
     close = price_df['close']
     mid   = close.rolling(period).mean()

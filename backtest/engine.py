@@ -52,12 +52,18 @@ def get_limit_mask(pct_chg_series):
 def select_stocks_at_date(signal_cache, yearly, df_daily, df_fin, basic_df,
                           name_map, industry_map, target_date, max_stocks=200):
     """
-    使用预计算缓存，在 target_date 选取股票（两层共振机制）。
-    无信号重算，只做缓存切片 + 筛选。
+    在 target_date 执行选股，返回 (selected, tier1, tier2)。
+
+    筛选链（逐级过滤）：
+      全A → 上市≥24月+停牌≤2天 → 年线趋势+流动性 → 四信号检测 → 财务 → 两层组合
+
+    两层组合：
+      Tier1(全信号共振) = 年线 ∩ 月回踩 ∩ 月布林 ∩ 周回踩 ∩ 财务  （四重交集，v4.3放宽）
+      Tier2(弹性降级)   = 年线 ∩ (月回踩∪周回踩) ∩ 财务 ∩ 剩余信号（三重或更少）
     """
     target_ts = pd.Timestamp(target_date)
 
-    # 1. 前置剔除
+    # 1. 前置剔除：上市≥24月 + 近40天≥18个交易日
     valid_codes = st.get_valid_codes(df_daily, target_ts, basic_df=basic_df)
 
     # 2. 年线趋势 + 流动性
@@ -80,7 +86,7 @@ def select_stocks_at_date(signal_cache, yearly, df_daily, df_fin, basic_df,
     if not base_codes:
         return [], [], []
 
-    # 3. 信号提取
+    # 3. 四信号提取（从预计算缓存切片，无重算）
     m_retest_codes, m_bb_codes, w_retest_codes, w_bb_codes = [], [], [], []
     for code in base_codes:
         entry = signal_cache[code]
@@ -99,25 +105,34 @@ def select_stocks_at_date(signal_cache, yearly, df_daily, df_fin, basic_df,
     else:
         logger.info("财务条件已关闭，全部通过")
 
-    # 5. 两层交集
+    # 5. 两层组合
+    # v4.3: 全信号共振从五重变为四重（去掉周布林）。原因：
+    #   五重交集样本量仅360次，且周布林相关信号收益为负（-64%累积）
+    #   月布林是收益最高的单一信号（+171%），始终作为必要条件
     core_set = (set(base_codes) & set(m_retest_codes) & set(m_bb_codes) &
-                set(w_retest_codes) & set(w_bb_codes) & set(fin_codes))
+                set(w_retest_codes) & set(fin_codes))
     hard_base = set(base_codes) & (set(m_retest_codes) | set(w_retest_codes)) & set(fin_codes)
 
     tier1, tier2 = [], []
     assigned = set()
+
     for code in sorted(core_set):
         assigned.add(code)
         tier1.append((code, '全信号共振'))
+
     for code in sorted(hard_base - assigned):
-        soft_a, soft_b = code in m_bb_codes, code in w_retest_codes
-        soft_c = soft_b and code in w_bb_codes
-        parts = []
-        if soft_a: parts.append('月布林')
-        if soft_b: parts.append('周二次回踩')
-        if soft_c: parts.append('周布林')
-        if parts:
-            tier2.append((code, '弹性降级：' + '+'.join(parts)))
+        signal_counts = {
+            '月回踩': code in m_retest_codes,
+            '月布林':  code in m_bb_codes,
+            '周回踩': code in w_retest_codes,
+            '周布林':  code in w_bb_codes,
+        }
+        active_signals = [k for k, v in signal_counts.items() if v]
+        # 过滤：单独的月回踩或周回踩不纳入 Tier2
+        if active_signals in (['月回踩'], ['周回踩']):
+            continue
+        if active_signals:
+            tier2.append((code, '弹性降级：' + '+'.join(active_signals)))
 
     final_selected = tier1 + tier2
     final = [(c, name_map.get(c, c), industry_map.get(c, ''), d)

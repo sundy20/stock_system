@@ -1,4 +1,4 @@
-# A股量化选股与回测系统 v4.2
+# A股量化选股与回测系统 v4.3
 
 基于「大周期趋势反转 + 基本面健康验证 + 中周期技术择时」的中线选股策略。
 
@@ -32,6 +32,10 @@ python3 pipeline/financial_baostock.py    # 财务（baostock, ~20分钟）
 python3 app/stock_checker.py                     # 最新交易日
 python3 app/stock_checker.py --date 2025-06-15   # 历史日期
 python3 app/stock_checker.py -f my_list.txt -o report.csv
+
+# 动态权重优化（基于信号归因自动调权）
+python3 app/dynamic_weights.py                   # 查看权重报告
+python3 app/dynamic_weights.py --apply           # 应用优化权重到 config.yaml
 
 # 数据质量校验
 python3 app/validator.py
@@ -71,7 +75,8 @@ stock_system/
 ├── app/                         # 应用入口
 │   ├── backtest_runner.py       # 选股回测入口
 │   ├── stock_checker.py         # 自选股诊断
-│   └── validator.py             # 数据质量校验
+│   ├── validator.py             # 数据质量校验
+│   └── dynamic_weights.py       # 动态权重优化（基于归因自动调权）
 │
 ├── scripts/                     # Shell 脚本
 │   ├── update_data.sh           # 一键更新数据
@@ -91,10 +96,11 @@ stock_system/
 | 文件 | 说明 |
 |------|------|
 | `selected_stocks.txt` | 选股结果，可导入同花顺 |
-| `selected_stocks_detail.txt` | 选股详情（含20周线、止损价） |
+| `selected_stocks_detail.csv` | 选股详情（含20周线、止损价），CSV格式 |
 | `signal_attribution.csv` | 信号归因（各信号交易次数、收益率、胜率） |
 | `.signal_cache.pkl` | 预计算缓存（数据更新后自动失效） |
 | `custom_selection_report.csv` | 自选股诊断报告 |
+| `weight_report.txt` | 动态权重优化报告 |
 
 ## 数据源
 

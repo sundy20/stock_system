@@ -16,3 +16,4 @@ __pycache__/
 /signal_attribution.csv
 /.signal_cache.pkl
 /backups/
+/selected_stocks_detail.csv

@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-公共选股策略模块 v4.2
+公共选股策略模块 v4.4
 
 由 app/backtest_runner.py 和 app/stock_checker.py 共同导入。
 修改策略参数：编辑项目根目录的 config.yaml。
 
-v4.2 改进：
-  - 目录结构重组：信号检测拆分至 signals.py
-  - 统一使用 db.schema 模块进行数据库操作
-  - 支持 config.yaml 配置加载
-  - 预计算磁盘缓存
+v4.4 改进：
+  - 信号标签体系重构：月回踩信号回归可见，Tier2 拼装补全四信号
+  - 过滤单独周回踩/月回踩（不产生独立标签）
+
+v4.3 改进：
+  - 全信号共振从五重交集改为四重+月布林要求，扩大样本量
+  - 新增动态权重优化模块
 """
 
 import warnings
@@ -40,54 +42,63 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 # ===================== 可调参数（默认值，可被 config.yaml 覆盖） =====================
+
+# -- 流动性（万元） --
 MIN_20D_AMOUNT = 2000
 MIN_120D_AMOUNT = 1500
 
-ROLLING_DAYS = 250
-ROLLING_PRICE_UP = 0.15
-ROLLING_VOL_UP = 0.30
-MA_SLOPE_THRESHOLD = 0
+# -- 年线趋势 --
+ROLLING_DAYS = 250             # 滚动周期≈12个月
+ROLLING_PRICE_UP = 0.15        # 滚动涨幅 ≥ 15%
+ROLLING_VOL_UP = 0.30          # 滚动量增 ≥ 30%
+MA_SLOPE_THRESHOLD = 0         # 年线斜率 ≥ 0
 
+# -- 月线回踩（1次即可） --
 MONTHLY_RETEST_DOWN = 0.12
 MONTHLY_RETEST_NEAR = 0.08
 MONTHLY_RETEST_WINDOW = 18
 MONTHLY_RETEST_MIN_GAP = 3
 MONTHLY_RETEST_MIN_TOUCHES = 1
 
+# -- 周线回踩（二次确认，必须2次） --
 WEEKLY_RETEST_DOWN = 0.12
 WEEKLY_RETEST_NEAR = 0.08
 WEEKLY_RETEST_WINDOW = 50
 WEEKLY_RETEST_MIN_GAP = 5
 WEEKLY_RETEST_MIN_TOUCHES = 2
 
+# -- 布林带 --
 BB_PERIOD = 20
 BB_STD_MULT = 2
-BB_SHORT_MA = 5
-BB_LONG_MA = 20
-BB_SHORT_DIR_PERIOD = 2
-BB_MID_DIR_PERIOD = 3
-MONTHLY_BB_REQUIRE_MID_UP = False
-WEEKLY_BB_REQUIRE_MID_UP = True
+BB_SHORT_MA = 5                # 短期带宽MA（检测扩张加速）
+BB_LONG_MA = 20                # 长期带宽MA（基线）
+BB_SHORT_DIR_PERIOD = 2        # 连续扩张期数
+BB_MID_DIR_PERIOD = 3          # 中轨方向判定周期
+MONTHLY_BB_REQUIRE_MID_UP = False   # 月布林不要求中轨向上
+WEEKLY_BB_REQUIRE_MID_UP = True     # 周布林要求中轨走平向上
 WEEKLY_BB_OVERBOUGHT = None
-WEEKLY_BB_PRE_EXPAND = True
-WEEKLY_BB_CONTRACTION_RATIO = 0.9
-WEEKLY_BB_USE_DUAL_MODE = True
+WEEKLY_BB_PRE_EXPAND = True         # 收缩预警模式
+WEEKLY_BB_CONTRACTION_RATIO = 0.9   # 收缩阈值
+WEEKLY_BB_USE_DUAL_MODE = True      # 双模式：标准扩张+收缩预警
 WEEKLY_BB_PRICE_LIMIT = None
 
-MA_DIR_PERIOD = 3
+MA_DIR_PERIOD = 3              # 均线方向判定周期
 
+# -- 财务筛选 --
 USE_FINANCIAL_FILTER = True
-FIN_CONSEC = 2
-MIN_PROFIT_YOY = 0.0
-MIN_PNI_YOY = 0.0
-MIN_NET_PROFIT = 10000000
-PROFIT_ACCELERATION = True    # 盈利加速度：最新季度增速 ≥ 前一季度
+FIN_CONSEC = 2                 # 连续季度数
+MIN_PROFIT_YOY = 0.0           # 归母净利同比 > 0%
+MIN_PNI_YOY = 0.0              # 扣非净利同比 > 0%
+MIN_NET_PROFIT = 10000000      # 单季度净利 ≥ 1000万
+PROFIT_ACCELERATION = True     # 盈利加速度：最新季度增速 ≥ 前一季度
 
-COMMISSION = 0.0001
-SLIPPAGE = 0.001
-STAMP_DUTY = 0.001
-REBALANCE_FREQ = 'W'
+# -- 交易成本 --
+COMMISSION = 0.0001            # 佣金万1
+SLIPPAGE = 0.001               # 滑点千1
+STAMP_DUTY = 0.001             # 印花税千1（卖出）
+REBALANCE_FREQ = 'W'           # 调仓频率：W=周 M=月
 
+# -- 数据 --
 DB_PATH = 'stocks_2y.db'
 BENCH_CODE = 'sh.000300'
 DB_MAX_RETRIES = 3
@@ -308,7 +319,11 @@ def get_valid_codes(df_daily, target_date, basic_df=None, conn=None):
 # ===================== 财务筛选 =====================
 
 def apply_financial_filter(fin_codes_base, df_fin, target_date):
-    """根据财务数据过滤股票。若关闭财务开关则直接返回原列表。"""
+    """
+    财务筛选：连续FIN_CONSEC季度满足净利同比>0、扣非>0、净利≥阈值、
+    ROE>0、毛利率>0。启用PROFIT_ACCELERATION时额外要求最新季度增速≥前一季度。
+    关闭USE_FINANCIAL_FILTER时直接返回原列表。
+    """
     if not USE_FINANCIAL_FILTER:
         return fin_codes_base
 
@@ -359,10 +374,14 @@ def get_latest_value(series, target_date):
 
 
 def check_annual_trend_fast(code, cache_entry, yearly, target_date):
-    """快速年线趋势检查（使用预计算指标，无未来函数）"""
+    """
+    年线趋势检查（无未来函数）。
+    通过条件（OR）：rolling_ok（12个月滚动）或 natural_ok（自然年收红）
+    natural_ok 作为 rolling_ok 的兜底：当股票上市不足500天无法计算滚动时生效
+    """
     target_ts = pd.Timestamp(target_date)
 
-    # 滚动12个月
+    # A. 滚动12个月：价涨量增+站上年线+斜率≥0
     rolling_ok = False
     rolling_series = cache_entry.get('rolling_ok')
     if rolling_series is not None and not rolling_series.empty:
@@ -370,7 +389,7 @@ def check_annual_trend_fast(code, cache_entry, yearly, target_date):
         if val is not None:
             rolling_ok = bool(val)
 
-    # 自然年验证
+    # B. 自然年收红兜底（上市较晚的股票）
     natural_ok = False
     last_year = target_ts.year - 1
     natural_years = cache_entry.get('natural_years', {})
@@ -447,9 +466,17 @@ def _save_cache(signal_cache, yearly):
 
 def precompute_all_signals_once(df_daily):
     """
-    一次性预计算所有股票的指标和信号。
+    一次性预计算所有股票的指标和信号，支持磁盘缓存。
 
-    v4.2: 支持磁盘缓存，第二次运行命中时跳过重算。
+    每个信号分月/周两个周期独立检测：
+      - rolling_ok:      年线250日趋势（价涨量增+站年线+斜率）
+      - natural_years:   自然年收红记录
+      - amount_ma20/120: 20/120日均成交额
+      - m_retest:        月线均线回踩（min_touches=1）
+      - w_retest:        周线均线二次回踩（min_touches=2）
+      - m_bb:            月线布林扩张（不要求中轨方向）
+      - w_bb:            周线布林扩张（双模式：标准+收缩预警）
+
     返回 (signal_cache, yearly)
     """
     t0 = time.time()

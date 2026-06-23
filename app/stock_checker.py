@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-同花顺自选股诊断脚本 v4.2
+同花顺自选股诊断脚本 v4.3
 
 使用方法：
   python3 app/stock_checker.py [--date YYYY-MM-DD] [-f watchlist.txt] [-o report.csv]
@@ -132,7 +132,7 @@ if __name__ == '__main__':
 
     t_start = time.time()
     logger.info("=" * 50)
-    logger.info("自选股诊断 v4.2")
+    logger.info("自选股诊断 v4.3")
     logger.info("=" * 50)
 
     if not os.path.exists(args.file):
@@ -181,9 +181,11 @@ if __name__ == '__main__':
     with open(args.output, 'w', encoding='utf-8') as f:
         f.write('类型,代码,名称,信号/原因\n')
         for code, name, sig in passed:
-            f.write(f'符合,{code},{name},{sig}\n')
+            plain_code = code.replace('sh.', '').replace('sz.', '').replace('bj.', '')
+            f.write(f'符合,{plain_code},{name},{sig}\n')
         for code, name, reason in failed:
-            f.write(f'不符合,{code},{name},{reason}\n')
+            plain_code = code.replace('sh.', '').replace('sz.', '').replace('bj.', '')
+            f.write(f'不符合,{plain_code},{name},{reason}\n')
 
     logger.info("=" * 50)
     logger.info("符合: %s 只 (%.1f%%)", len(passed), len(passed)/len(watchlist)*100 if watchlist else 0)

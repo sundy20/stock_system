@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-选股 + 回测 + 导出 入口（v4.2）
+选股 + 回测 + 导出 入口（v4.4）
 
 使用方法：
     python3 app/backtest_runner.py
-
-等同于原来的 backtest_twice_retest.py。
 """
 
 import pandas as pd
@@ -39,19 +37,32 @@ MAX_STOCKS     = 200
 STOP_LOSS_ENABLED = True
 STOP_LOSS_PCT     = -10.0
 
-# 信号评分权重
+# 信号评分权重（默认值，会被 config.yaml 覆盖）
+# 排序逻辑：多信号共振 > 少信号，含月布林 > 不含，含月回踩 > 不含
 SIGNAL_SCORES = {
-    '月布林+周二次回踩+周布林': 9,
-    '月布林+周二次回踩': 10,       # ★ 历史最佳
-    '全信号共振': 8,
-    '月布林': 7,
-    '周二次回踩+周布林': 6,
-    '周二次回踩': 5,
+    # Tier1
+    '全信号共振': 5,
+    # Tier2 — 四信号
+    '月回踩+月布林+周回踩+周布林': 12,
+    # Tier2 — 三信号
+    '月回踩+月布林+周回踩': 15,
+    '月回踩+月布林+周布林': 8,
+    '月回踩+周回踩+周布林': 6,
+    '月布林+周回踩+周布林': 8,
+    # Tier2 — 两信号
+    '月回踩+月布林': 10,
+    '月回踩+周回踩': 7,
+    '月回踩+周布林': 4,
+    '月布林+周回踩': 8,
+    '周回踩+周布林': 3,
 }
 
 
 def _build_signal_scores():
-    """从 config.yaml 加载信号权重，失败则用默认值"""
+    """
+    从 config.yaml 加载信号权重，映射缩写 key → 中文标签。
+    缩写规则：mr=月回踩 mb=月布林 wr=周回踩 wb=周布林
+    """
     try:
         import yaml
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -59,33 +70,47 @@ def _build_signal_scores():
         if os.path.exists(config_path):
             with open(config_path) as f:
                 cfg = yaml.safe_load(f)
-            sr = cfg.get('strategy', {}).get('signal_ranking', {})
-            if sr:
-                return {
-                    '月布林+周二次回踩+周布林': sr.get('w_retest_w_bb', 6),
-                    '月布林+周二次回踩': sr.get('m_bb_w_retest', 10),
-                    '全信号共振': sr.get('all_resonance', 8),
-                    '月布林': sr.get('m_bb', 7),
-                    '周二次回踩+周布林': sr.get('w_retest_w_bb', 6),
-                    '周二次回踩': sr.get('w_retest', 5),
-                }
+        sr = cfg.get('strategy', {}).get('signal_ranking', {})
+        if sr:
+            return {
+                '全信号共振':                     float(sr.get('all_resonance', 5)),
+                '月回踩+月布林+周回踩+周布林':   float(sr.get('mr_mb_wr_wb', 12)),
+                '月回踩+月布林+周回踩':          float(sr.get('mr_mb_wr', 15)),
+                '月回踩+月布林+周布林':          float(sr.get('mr_mb_wb', 8)),
+                '月回踩+周回踩+周布林':          float(sr.get('mr_wr_wb', 6)),
+                '月布林+周回踩+周布林':          float(sr.get('mb_wr_wb', 8)),
+                '月回踩+月布林':                 float(sr.get('mr_mb', 10)),
+                '月回踩+周回踩':                 float(sr.get('mr_wr', 7)),
+                '月回踩+周布林':                 float(sr.get('mr_wb', 4)),
+                '月布林+周回踩':                 float(sr.get('mb_wr', 8)),
+                '周回踩+周布林':                 float(sr.get('wr_wb', 3)),
+            }
     except Exception:
         pass
     return SIGNAL_SCORES
 
 
 def _calc_composite_score(signal_desc, signal_scores):
-    """根据信号描述计算综合评分"""
+    """
+    信号描述 → 综合评分。
+    11种Tier2组合已全覆盖，精确匹配优先；
+    分量交集匹配仅作兜底（处理异常标签），最低 1.0 分。
+    """
     desc = signal_desc.replace('弹性降级：', '')
-    # 精确匹配
     if desc in signal_scores:
         return float(signal_scores[desc])
-    # 模糊匹配（取最高匹配分）
-    best = 0
-    for key, val in signal_scores.items():
-        if key in desc or desc in key:
-            best = max(best, val)
-    return float(best) if best > 0 else 3.0
+
+    # 兜底：分量交集最大 + 分量数最接近
+    desc_parts = set(desc.split('+'))
+    best_key, best = None, (0, 0)
+    for key in signal_scores:
+        key_parts = set(key.split('+'))
+        overlap = len(desc_parts & key_parts)
+        dist = -abs(len(desc_parts) - len(key_parts))
+        if (overlap, dist) > best:
+            best = (overlap, dist)
+            best_key = key
+    return float(signal_scores.get(best_key, 1.0))
 
 
 def _load_params():
@@ -119,7 +144,7 @@ if __name__ == '__main__':
     _load_params()
     t_start = time.time()
     logger.info("=" * 50)
-    logger.info("回测系统启动 v4.2")
+    logger.info("回测系统启动 v4.4")
     logger.info("=" * 50)
 
     # 数据校验
@@ -182,7 +207,7 @@ if __name__ == '__main__':
         with open('selected_stocks.txt', 'w') as f:
             for c, n, _, _, _ in selected:
                 f.write(f"{c.replace('sh.','').replace('sz.','').replace('bj.','')},{n}\n")
-        with open('selected_stocks_detail.txt', 'w') as f:
+        with open('selected_stocks_detail.csv', 'w', newline='') as f:
             f.write("综合评分,代码,名称,行业,信号组合,20周线,20月线,布林上轨(周),止损参考(10%)\n")
             for c, n, ind, s, score in selected:
                 plain = c.replace('sh.','').replace('sz.','').replace('bj.','')
@@ -192,7 +217,7 @@ if __name__ == '__main__':
                 last_close = close_sel[c].iloc[-1] if c in close_sel.columns else ''
                 stop_loss = round(last_close * 0.9, 2) if isinstance(last_close, (int, float)) else ''
                 f.write(f"{score},{plain},{n},{ind},{s},{w20v},{m20v},{wupp},{stop_loss}\n")
-        logger.info("结果已导出至 selected_stocks.txt / selected_stocks_detail.txt")
+        logger.info("结果已导出至 selected_stocks.txt / selected_stocks_detail.csv")
 
     # 回测
     logger.info("=" * 50)
