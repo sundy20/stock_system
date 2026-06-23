@@ -17,3 +17,4 @@ __pycache__/
 /.signal_cache.pkl
 /backups/
 /selected_stocks_detail.csv
+/weight_report.txt

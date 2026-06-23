@@ -15,7 +15,6 @@
 
 import os
 import csv
-import yaml
 import logging
 from typing import Dict
 
@@ -195,9 +194,7 @@ class DynamicWeightOptimizer:
                        weights: Dict[str, float] = None) -> Dict[str, float]:
         """
         将权重写入 config.yaml 的 strategy.signal_ranking。
-        覆盖写入：先清空旧值，再写入标准 key（与 backtest_runner 读取一致）。
-
-        返回: 更新后的权重字典
+        文本级替换 signal_ranking 块，保留文件中所有注释和其他配置。
         """
         if weights is None:
             weights = self.calculate_optimal_weights()
@@ -208,28 +205,69 @@ class DynamicWeightOptimizer:
 
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
+                lines = f.readlines()
 
-            # 更新signal_ranking
-            if 'strategy' not in config:
-                config['strategy'] = {}
-            if 'signal_ranking' not in config['strategy']:
-                config['strategy']['signal_ranking'] = {}
+            # 找到 signal_ranking: 行
+            sr_line_idx = None
+            sr_indent = 0
+            for i, line in enumerate(lines):
+                stripped = line.lstrip()
+                if stripped.startswith('signal_ranking:'):
+                    sr_line_idx = i
+                    sr_indent = len(line) - len(line.lstrip())
+                    break
 
-            # 将权重映射为 config.yaml 的标准 key
+            if sr_line_idx is None:
+                logger.error("配置文件中未找到 signal_ranking 字段")
+                return {}
+
+            # 删除 signal_ranking 下所有缩进更深的子行
+            # 删除规则：缩进 > sr_indent 的行全部删掉（包括子注释）
+            # 遇到缩进 <= sr_indent 且非空的行时停止
+            end_idx = sr_line_idx + 1
+            while end_idx < len(lines):
+                line = lines[end_idx]
+                stripped = line.strip()
+                if stripped == '':
+                    # 空行：查看下一行决定是否保留
+                    # 如果下一行缩进 > sr_indent，则删除当前空行（子块内部空行）
+                    # 否则保留（区块分隔空行）
+                    if end_idx + 1 < len(lines):
+                        next_indent = len(lines[end_idx + 1]) - len(lines[end_idx + 1].lstrip())
+                        if next_indent > sr_indent:
+                            end_idx += 1
+                            continue
+                    break
+                indent = len(line) - len(stripped)
+                if indent > sr_indent:
+                    end_idx += 1
+                    continue
+                break
+
+            # 删除旧的子行
+            del lines[sr_line_idx + 1:end_idx]
+
+            # 构建新的 signal_ranking 键值对
             sr = {}
             for attr_type, weight in weights.items():
                 config_key = self._attr_to_config_key(attr_type)
                 sr[config_key] = weight
-            config['strategy']['signal_ranking'] = sr
 
-            # 写回文件
+            child_indent = sr_indent + 2
+            prefix = ' ' * child_indent
+            new_lines = []
+            for key, val in sorted(sr.items(), key=lambda x: -x[1]):
+                new_lines.append(f"{prefix}{key}: {val}\n")
+
+            # 插入到 signal_ranking: 行之后
+            for i, new_line in enumerate(new_lines):
+                lines.insert(sr_line_idx + 1 + i, new_line)
+
             with open(config_path, 'w', encoding='utf-8') as f:
-                yaml.dump(config, f, allow_unicode=True, default_flow_style=False,
-                          sort_keys=False, indent=2)
+                f.writelines(lines)
 
-            logger.info(f"已更新配置文件: {config_path}")
-            return config['strategy']['signal_ranking']
+            logger.info(f"已更新配置文件: {config_path}（注释保留）")
+            return sr
 
         except Exception as e:
             logger.error(f"更新配置文件失败: {e}")
