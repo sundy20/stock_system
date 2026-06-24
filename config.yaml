@@ -97,7 +97,7 @@ backtest:
   init_cash: 1000000             # 初始资金
   max_stocks: 200                # 单期最大持仓数
   lookback_years: 2              # 回溯年数
-  rebalance_freq: W              # 调仓频率：M=月线 W=周线（v4.5 改为周频）
+  rebalance_freq: M              # 调仓频率：M=月线 W=周线
   commission: 0.0001             # 佣金（万1）
   slippage: 0.001                # 滑点（千1）
   stamp_duty: 0.001              # 卖出印花税（千1）
