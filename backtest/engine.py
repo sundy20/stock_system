@@ -134,6 +134,10 @@ def select_stocks_at_date(signal_cache, yearly, df_daily, df_fin, basic_df,
         if active_signals:
             tier2.append((code, '弹性降级：' + '+'.join(active_signals)))
 
+    # ★ v4.5: 按趋势强度排序，强者优先（max_stocks 截断时保留最强）
+    tier1.sort(key=lambda x: st.compute_trend_strength(x[0], df_daily, target_ts), reverse=True)
+    tier2.sort(key=lambda x: st.compute_trend_strength(x[0], df_daily, target_ts), reverse=True)
+
     final_selected = tier1 + tier2
     final = [(c, name_map.get(c, c), industry_map.get(c, ''), d)
              for c, d in final_selected[:max_stocks]]

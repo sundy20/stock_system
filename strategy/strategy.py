@@ -404,6 +404,70 @@ def check_annual_trend_fast(code, cache_entry, yearly, target_date):
     return rolling_ok or natural_ok
 
 
+# ===================== 趋势强度评分 =====================
+
+def compute_trend_strength(code, df_daily, target_date):
+    """
+    计算趋势强度评分（0-100），用于同信号类型内的排序。
+    只依赖 target_date 之前的数据，无未来函数。
+
+    三个维度：
+      1. 年线乖离率 (0-40分)：最优区间3%~20%，站上过远扣分
+      2. 均线多头排列 (0-40分)：MA20>MA60>MA120>MA250 逐级给分
+      3. 近20日涨幅 (0-20分)：正值加分，负值零分
+    """
+    try:
+        df = df_daily.loc[code].sort_index()
+    except KeyError:
+        return 0.0
+
+    target_ts = pd.Timestamp(target_date)
+    df = df[df.index <= target_ts]
+    if len(df) < 250:
+        return 0.0
+
+    close = df['close']
+    last_close = close.iloc[-1]
+
+    # 均线
+    ma20 = close.rolling(20).mean().iloc[-1]
+    ma60 = close.rolling(60).mean().iloc[-1]
+    ma120 = close.rolling(120).mean().iloc[-1]
+    ma250 = close.rolling(250).mean().iloc[-1]
+
+    if pd.isna(ma250) or ma250 <= 0:
+        return 0.0
+
+    # 1. 年线乖离率 (0-40分)：黄金区间 3%~20%
+    deviation = (last_close / ma250 - 1) * 100
+    if 3 <= deviation <= 20:
+        dev_score = 40.0
+    elif 0 <= deviation < 3:
+        dev_score = (deviation / 3) * 40  # 刚站上年线，线性给分
+    elif deviation > 20:
+        dev_score = max(0, 40 - (deviation - 20) * 2)  # 乖离过大扣分
+    else:
+        dev_score = 0
+
+    # 2. 均线多头排列 (0-40分)：三层对齐各13.3分
+    align_score = 0.0
+    if not pd.isna(ma20) and not pd.isna(ma60) and ma20 > ma60:
+        align_score += 13.3
+    if not pd.isna(ma60) and not pd.isna(ma120) and ma60 > ma120:
+        align_score += 13.3
+    if not pd.isna(ma120) and not pd.isna(ma250) and ma120 > ma250:
+        align_score += 13.3
+
+    # 3. 近20日涨幅 (0-20分)
+    ret_score = 0.0
+    if len(close) >= 20:
+        ret_20d = (close.iloc[-1] / close.iloc[-20] - 1) * 100
+        if ret_20d > 0:
+            ret_score = min(20, ret_20d * 1.33)  # 0~15%涨幅映射到0~20分
+
+    return round(dev_score + align_score + ret_score, 1)
+
+
 # ===================== 预计算 =====================
 
 def _get_cache_key():

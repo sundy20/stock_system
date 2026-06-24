@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-选股 + 回测 + 导出 入口（v4.4）
+选股 + 回测 + 导出 入口（v4.5）
 
 使用方法：
     python3 app/backtest_runner.py
@@ -183,40 +183,41 @@ if __name__ == '__main__':
     else:
         df_f = df_daily[df_daily.index.get_level_values('code').isin([s[0] for s in selected])]
         close_sel = df_f['close'].unstack(level='code')
-        weekly_close = close_sel.resample('W').last()
-        monthly_close = close_sel.resample('M').last()
+        weekly_close = close_sel.resample('W').last().ffill()   # ffill: 填补春节等休市周
+        monthly_close = close_sel.resample('M').last().ffill()
         w20 = weekly_close.rolling(20).mean().iloc[-1] if len(weekly_close) >= 20 else None
         m20 = monthly_close.rolling(20).mean().iloc[-1] if len(monthly_close) >= 20 else None
         w_std = weekly_close.rolling(20).std().iloc[-1] if len(weekly_close) >= 20 else None
         w_mid = weekly_close.rolling(20).mean().iloc[-1] if len(weekly_close) >= 20 else None
         w_upper = w_mid + 2 * w_std if w_mid is not None and w_std is not None else None
 
-        # ★ v4.2: 信号优先级排序 + 综合评分
+        # ★ v4.5: 信号优先级排序 + 趋势强度二次排序
         signal_scores = _build_signal_scores()
         for i, (c, n, ind, s) in enumerate(selected):
             score = _calc_composite_score(s, signal_scores)
-            selected[i] = (c, n, ind, s, score)
+            ts = st.compute_trend_strength(c, df_daily, target_date)
+            selected[i] = (c, n, ind, s, score, ts)
 
-        selected.sort(key=lambda x: x[4], reverse=True)
+        selected.sort(key=lambda x: (x[4], x[5]), reverse=True)
 
-        logger.info("最终选股池（按综合评分排序）：")
-        for c, n, ind, s, score in selected:
-            logger.info("  %5.1f %s %s [%s] %s", score, c, n, ind, s)
+        logger.info("最终选股池（按综合评分+趋势强度排序）：")
+        for c, n, ind, s, score, ts in selected:
+            logger.info("  %5.1f [TS:%5.1f] %s %s [%s] %s", score, ts, c, n, ind, s)
 
         # 导出
         with open('selected_stocks.txt', 'w') as f:
-            for c, n, _, _, _ in selected:
+            for c, n, _, _, _, _ in selected:
                 f.write(f"{c.replace('sh.','').replace('sz.','').replace('bj.','')},{n}\n")
         with open('selected_stocks_detail.csv', 'w', newline='') as f:
-            f.write("综合评分,代码,名称,行业,信号组合,20周线,20月线,布林上轨(周),止损参考(10%)\n")
-            for c, n, ind, s, score in selected:
+            f.write("综合评分,趋势强度,代码,名称,行业,信号组合,20周线,20月线,布林上轨(周),止损参考(10%)\n")
+            for c, n, ind, s, score, ts in selected:
                 plain = c.replace('sh.','').replace('sz.','').replace('bj.','')
                 w20v = w20.get(c, '') if w20 is not None else ''
                 m20v = m20.get(c, '') if m20 is not None else ''
                 wupp = w_upper.get(c, '') if w_upper is not None else ''
                 last_close = close_sel[c].iloc[-1] if c in close_sel.columns else ''
                 stop_loss = round(last_close * 0.9, 2) if isinstance(last_close, (int, float)) else ''
-                f.write(f"{score},{plain},{n},{ind},{s},{w20v},{m20v},{wupp},{stop_loss}\n")
+                f.write(f"{score},{ts},{plain},{n},{ind},{s},{w20v},{m20v},{wupp},{stop_loss}\n")
         logger.info("结果已导出至 selected_stocks.txt / selected_stocks_detail.csv")
 
     # 回测

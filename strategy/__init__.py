@@ -33,6 +33,7 @@ from .strategy import (
     validate_data,
     get_valid_codes, apply_financial_filter,
     get_latest_value, check_annual_trend_fast,
+    compute_trend_strength,
     precompute_all_signals_once,
 )
 
