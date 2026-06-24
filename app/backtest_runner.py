@@ -144,7 +144,7 @@ if __name__ == '__main__':
     _load_params()
     t_start = time.time()
     logger.info("=" * 50)
-    logger.info("回测系统启动 v4.4")
+    logger.info("回测系统启动 v4.6")
     logger.info("=" * 50)
 
     # 数据校验

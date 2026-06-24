@@ -25,13 +25,13 @@ strategy:
     rolling_vol_up: 0.3          # 滚动日均成交额增幅 ≥ 30%
     ma_slope_threshold: 0        # 年线斜率 ≥ 0（走平或向上）
 
-  # 月线回踩：二次回踩确认（v4.6: min_touches 1→2）
+  # 月线回踩：价格回踩20月均线
   monthly_retest:
     down_tolerance: 0.12         # 下探 MA 幅度 ≤ 12%
     near_tolerance: 0.08         # 靠近 MA 幅度 ≤ 8%
     window: 18                   # 观察窗口（根月K线）
     min_gap: 3                   # 两次回踩最小间隔（根）
-    min_touches: 2               # ★ 二次回踩确认，提升信号质量
+    min_touches: 1               # 最少回踩次数（v4.6：改为趋势强度额外加分）
 
   # 周线回踩：二次回踩确认
   weekly_retest:

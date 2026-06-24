@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-公共选股策略模块 v4.4
+公共选股策略模块 v4.6
 
 由 app/backtest_runner.py 和 app/stock_checker.py 共同导入。
 修改策略参数：编辑项目根目录的 config.yaml。
@@ -68,6 +68,7 @@ WEEKLY_RETEST_MIN_GAP = 5
 WEEKLY_RETEST_MIN_TOUCHES = 2
 
 # -- 布林带：趋势延续（Trend Continuation） --
+BB_TC_ENABLED = True
 BB_PERIOD = 20
 BB_STD_MULT = 2
 BB_SHORT_MA = 5                # 带宽短期MA（检测扩张加速）
@@ -98,7 +99,7 @@ PROFIT_ACCELERATION = True     # 盈利加速度：最新季度增速 ≥ 前一
 COMMISSION = 0.0001            # 佣金万1
 SLIPPAGE = 0.001               # 滑点千1
 STAMP_DUTY = 0.001             # 印花税千1（卖出）
-REBALANCE_FREQ = 'W'           # 调仓频率：W=周 M=月
+REBALANCE_FREQ = 'M'           # 调仓频率：M=月 W=周
 
 # -- 数据 --
 DB_PATH = 'stocks_2y.db'
@@ -171,7 +172,8 @@ def _load_config():
             if k in bb: globals()[g] = bb[k]
 
         tc = bb.get('trend_continuation', {})
-        for k, g in [('short_ma', 'BB_SHORT_MA'), ('long_ma', 'BB_LONG_MA'),
+        for k, g in [('enabled', 'BB_TC_ENABLED'),
+                     ('short_ma', 'BB_SHORT_MA'), ('long_ma', 'BB_LONG_MA'),
                      ('consecutive_periods', 'BB_SHORT_DIR_PERIOD'),
                      ('mid_dir_period', 'BB_MID_DIR_PERIOD'),
                      ('require_mid_up', 'WEEKLY_BB_REQUIRE_MID_UP'),
@@ -419,14 +421,15 @@ def check_annual_trend_fast(code, cache_entry, yearly, target_date):
 
 def compute_trend_strength(code, df_daily, target_date):
     """
-    计算趋势强度评分（0-110），用于同信号类型内的排序。
+    计算趋势强度评分（0-120），用于同信号类型内的排序。
     只依赖 target_date 之前的数据，无未来函数。
 
-    四个维度：
-      1. 年线乖离率 (0-40分)：最优区间3%~20%，站上过远扣分
+    五个维度：
+      1. 年线乖离率  (0-40分)：最优区间3%~20%，站上过远扣分
       2. 均线多头排列 (0-40分)：MA20>MA60>MA120>MA250 逐级给分
-      3. 近20日涨幅 (0-20分)：正值加分，负值零分
-      4. Squeeze预警   (0-10分)：带宽越接近历史低分位，弹性势能越大
+      3. 近20日涨幅  (0-20分)：正值加分，负值零分
+      4. Squeeze预警  (0-10分)：带宽越接近历史低分位，弹性势能越大
+      5. 月线回踩确认 (0-10分)：回踩≥2次额外加分，二次确认更可靠
     """
     try:
         df = df_daily.loc[code].sort_index()
@@ -487,7 +490,37 @@ def compute_trend_strength(code, df_daily, target_date):
         if not pd.isna(bw_pct) and bw_pct <= 0.30:
             sq_score = round((0.30 - bw_pct) / 0.30 * 10, 1)
 
-    return round(dev_score + align_score + ret_score + sq_score, 1)
+    # 5. 月线二次回踩加分 (0-10分)：回踩≥2次加满分，1次加5分
+    retest_bonus = 0.0
+    if len(close) >= 500:
+        df_m = df[['close', 'low']].resample('M').agg({'close': 'last', 'low': 'min'}).dropna()
+        if len(df_m) >= 18:
+            ma_m = df_m['close'].rolling(20).mean()
+            ma_up_m = ma_m > ma_m.shift(1).rolling(MA_DIR_PERIOD).mean()
+            touch_down = (df_m['low'] < ma_m) & ((ma_m - df_m['low']) / ma_m <= MONTHLY_RETEST_DOWN)
+            touch_near = (df_m['low'] >= ma_m) & ((df_m['low'] - ma_m) / ma_m <= MONTHLY_RETEST_NEAR)
+            touch = (touch_down | touch_near) & ma_up_m
+            touch_int = touch.astype(int)
+            starts = (touch_int.diff() == 1)
+            if len(touch_int) > 0 and touch_int.iloc[0] == 1:
+                starts.iloc[0] = True
+            if starts.any():
+                pos = np.where(starts.values)[0]
+                filtered = np.zeros(len(starts), dtype=bool)
+                gap = MONTHLY_RETEST_MIN_GAP
+                last = -gap - 1
+                for p in pos:
+                    if p - last >= gap:
+                        filtered[p] = True
+                        last = p
+                starts = pd.Series(filtered, index=starts.index)
+            touch_count = starts.rolling(MONTHLY_RETEST_WINDOW, min_periods=1).sum().iloc[-1]
+            if touch_count >= 2:
+                retest_bonus = 10.0
+            elif touch_count >= 1:
+                retest_bonus = 5.0
+
+    return round(dev_score + align_score + ret_score + sq_score + retest_bonus, 1)
 
 
 # ===================== 预计算 =====================
@@ -509,6 +542,7 @@ def _get_cache_key():
             'bb_period': BB_PERIOD, 'bb_std': BB_STD_MULT,
             'bb_short': BB_SHORT_MA, 'bb_long': BB_LONG_MA,
             'bb_short_dir': BB_SHORT_DIR_PERIOD, 'bb_mid_dir': BB_MID_DIR_PERIOD,
+            'bb_tc_enabled': BB_TC_ENABLED,
             'mb_mid_up': MONTHLY_BB_REQUIRE_MID_UP, 'wb_mid_up': WEEKLY_BB_REQUIRE_MID_UP,
             'sq_enabled': BB_SQ_ENABLED, 'sq_mid_up': BB_SQ_REQUIRE_MID_UP,
             'sq_pct': BB_SQ_CONTRACTION_PCT, 'sq_lookback': BB_SQ_CONTRACTION_LOOKBACK,
@@ -561,8 +595,9 @@ def precompute_all_signals_once(df_daily):
       - amount_ma20/120: 20/120日均成交额
       - m_retest:        月线均线回踩（min_touches=1）
       - w_retest:        周线均线二次回踩（min_touches=2）
-      - m_bb:            月线布林扩张（不要求中轨方向）
-      - w_bb:            周线布林扩张（双模式：标准+收缩预警）
+      - m_bb:            月线布林趋势延续（不要求中轨方向）
+      - w_bb:            周线布林趋势延续（要求中轨走平向上）
+      - w_bb_sq:         周线布林挤压爆发（不等均线确认）
 
     返回 (signal_cache, yearly)
     """
@@ -646,20 +681,21 @@ def precompute_all_signals_once(df_daily):
                     df_m, 20, MONTHLY_RETEST_DOWN, MONTHLY_RETEST_NEAR,
                     MONTHLY_RETEST_WINDOW, MONTHLY_RETEST_MIN_GAP,
                     MONTHLY_RETEST_MIN_TOUCHES, True)
-                w_bb = detect_bb_expand(
-                    df_w, BB_PERIOD, BB_STD_MULT, BB_SHORT_MA, BB_LONG_MA,
-                    require_mid_up=WEEKLY_BB_REQUIRE_MID_UP,
-                    short_dir_period=BB_SHORT_DIR_PERIOD,
-                    overbought_limit=None,
-                    pre_expand=False,
-                    use_dual_mode=False)
-                m_bb = detect_bb_expand(
-                    df_m, BB_PERIOD, BB_STD_MULT, BB_SHORT_MA, BB_LONG_MA,
-                    require_mid_up=MONTHLY_BB_REQUIRE_MID_UP,
-                    short_dir_period=BB_SHORT_DIR_PERIOD,
-                    overbought_limit=None,
-                    pre_expand=False,
-                    use_dual_mode=False)
+                if BB_TC_ENABLED:
+                    w_bb = detect_bb_expand(
+                        df_w, BB_PERIOD, BB_STD_MULT, BB_SHORT_MA, BB_LONG_MA,
+                        require_mid_up=WEEKLY_BB_REQUIRE_MID_UP,
+                        short_dir_period=BB_SHORT_DIR_PERIOD,
+                        overbought_limit=None,
+                        pre_expand=False,
+                        use_dual_mode=False)
+                    m_bb = detect_bb_expand(
+                        df_m, BB_PERIOD, BB_STD_MULT, BB_SHORT_MA, BB_LONG_MA,
+                        require_mid_up=MONTHLY_BB_REQUIRE_MID_UP,
+                        short_dir_period=BB_SHORT_DIR_PERIOD,
+                        overbought_limit=None,
+                        pre_expand=False,
+                        use_dual_mode=False)
                 if BB_SQ_ENABLED:
                     w_bb_sq = detect_squeeze_breakout(
                         df_w, BB_PERIOD, BB_STD_MULT,

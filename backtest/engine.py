@@ -102,7 +102,7 @@ def select_stocks_at_date(signal_cache, yearly, df_daily, df_fin, basic_df,
 
     logger.info("月线回踩: %s 只，月线布林: %s 只", len(m_retest_codes), len(m_bb_codes))
     logger.info("周线回踩: %s 只，周线布林: %s 只 (趋势延续=%s, 挤压爆发=%s)",
-                len(w_bb_codes), len(w_bb_tc_codes), len(w_bb_sq_codes))
+                len(w_retest_codes), len(w_bb_codes), len(w_bb_tc_codes), len(w_bb_sq_codes))
 
     # 4. 财务筛选
     fin_codes = st.apply_financial_filter(base_codes, df_fin, target_ts)
@@ -141,8 +141,12 @@ def select_stocks_at_date(signal_cache, yearly, df_daily, df_fin, basic_df,
             tier2.append((code, '弹性降级：' + '+'.join(active_signals)))
 
     # ★ v4.5: 按趋势强度排序，强者优先（max_stocks 截断时保留最强）
-    tier1.sort(key=lambda x: st.compute_trend_strength(x[0], df_daily, target_ts), reverse=True)
-    tier2.sort(key=lambda x: st.compute_trend_strength(x[0], df_daily, target_ts), reverse=True)
+    # 先批量计算，避免 sort key 重复调用
+    ts_cache = {}
+    for code, _ in tier1 + tier2:
+        ts_cache[code] = st.compute_trend_strength(code, df_daily, target_ts)
+    tier1.sort(key=lambda x: ts_cache[x[0]], reverse=True)
+    tier2.sort(key=lambda x: ts_cache[x[0]], reverse=True)
 
     final_selected = tier1 + tier2
     final = [(c, name_map.get(c, c), industry_map.get(c, ''), d)
@@ -214,6 +218,11 @@ def run_backtest_optimized(signal_cache, yearly, df_daily, df_fin, basic_df,
             for day in inter_days:
                 # 止损检查
                 if stop_loss_enabled and holdings:
+                    # 当日涨跌停（只算一次，同一天所有股票共用）
+                    day_limit_down = pd.Series(False, dtype=bool)
+                    if day in pct_chg_df.index:
+                        _, day_limit_down = get_limit_mask(pct_chg_df.loc[day])
+
                     for c in list(holdings.keys()):
                         if c not in stock_close.columns or c not in signal_positions:
                             continue
@@ -223,14 +232,19 @@ def run_backtest_optimized(signal_cache, yearly, df_daily, df_fin, basic_df,
                         _, buy_price, sig_label = signal_positions[c]
                         pnl_pct = (current_price / buy_price - 1) * 100
                         if pnl_pct <= stop_loss_pct:
+                            # 跌停无法卖出，跳过
+                            if day_limit_down.get(c, False):
+                                continue
                             # 执行止损卖出
                             shares = holdings.pop(c)
                             sell_amount = shares * current_price
+                            slippage = sell_amount * st.SLIPPAGE
                             commission = max(sell_amount * st.COMMISSION, 5.0)
                             stamp = sell_amount * st.STAMP_DUTY
-                            cash += sell_amount - commission - stamp
+                            cash += sell_amount - slippage - commission - stamp
                             total_commission += commission
                             total_stamp_duty += stamp
+                            total_slippage += slippage
                             total_turnover += sell_amount
                             stop_loss_count += 1
                             total_stop_loss_amount += sell_amount
@@ -258,12 +272,13 @@ def run_backtest_optimized(signal_cache, yearly, df_daily, df_fin, basic_df,
                 sell_price = stock_close.loc[d, c]
                 shares = holdings[c]
                 sell_amount = shares * sell_price
+                slippage = sell_amount * st.SLIPPAGE
                 commission = max(sell_amount * st.COMMISSION, 5.0)
                 stamp = sell_amount * st.STAMP_DUTY
-                sell_cost = commission + stamp
-                cash += sell_amount - sell_cost
+                cash += sell_amount - slippage - commission - stamp
                 total_commission += commission
                 total_stamp_duty += stamp
+                total_slippage += slippage
                 total_turnover += sell_amount
                 # 信号归因
                 if c in signal_positions:
@@ -280,7 +295,9 @@ def run_backtest_optimized(signal_cache, yearly, df_daily, df_fin, basic_df,
         # 等权买入
         if targets:
             buy_targets = [c for c in targets
-                          if not limit_up_mask.get(c, False) and not limit_down_mask.get(c, False)]
+                          if not limit_up_mask.get(c, False) and not limit_down_mask.get(c, False)
+                          and not (d in pct_chg_df.index and c in pct_chg_df.columns
+                                   and pd.isna(pct_chg_df.loc[d, c]))]
             if buy_targets:
                 prices = stock_close.loc[d, buy_targets]
                 avg_cash = cash / len(prices)
