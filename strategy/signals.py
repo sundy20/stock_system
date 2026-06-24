@@ -121,3 +121,47 @@ def detect_bb_expand(price_df, period=20, std_mult=2, short_ma=5, long_ma=20,
     if overbought_limit is not None:
         cond = cond & (close <= upper * overbought_limit)
     return cond
+
+
+def detect_squeeze_breakout(price_df, period=20, std_mult=2,
+                             contraction_percentile=10, contraction_lookback=50,
+                             expansion_confirm=2, require_mid_up=False):
+    """
+    挤压爆发信号检测（Squeeze Breakout）。
+
+    John Bollinger: "The Squeeze is the single most important BB signal."
+    弹簧压到最紧 → 弹开 → 主升浪启动。
+
+    四个条件：
+      1. price > mid                    — 价格站上中轨
+      2. bandwidth_percentile ≤ N%     — 带宽处于历史极低分位（弹簧压紧）
+      3. bandwidth 连续 N 期回升        — 正在弹开（不是随机噪声）
+      4. require_mid_up（可选）          — 中轨走平或向上
+    """
+    close = price_df['close']
+    mid = close.rolling(period).mean()
+    std = close.rolling(period).std()
+    upper = mid + std_mult * std
+    lower = mid - std_mult * std
+    bandwidth = (upper - lower) / mid
+
+    # 1. 价格站上中轨
+    above_mid = close > mid
+
+    # 2. 带宽历史百分位：当前带宽在最近 N 根 K 线中处于什么位置
+    bw_percentile = bandwidth.rolling(contraction_lookback,
+                                      min_periods=max(period, contraction_lookback // 2)).rank(pct=True)
+    in_squeeze = bw_percentile <= (contraction_percentile / 100.0)
+
+    # 3. 带宽连续 N 期回升
+    bw_rising = bandwidth.diff(1) > 0
+    rising_confirmed = bw_rising.rolling(expansion_confirm).sum() == expansion_confirm
+
+    # 4. 中轨方向（默认不要求，Squeeze 爆发本身就是最强确认）
+    if require_mid_up:
+        mid_up = mid >= mid.shift(1).rolling(3).mean()
+        base_cond = above_mid & mid_up
+    else:
+        base_cond = above_mid
+
+    return base_cond & in_squeeze & rising_confirmed

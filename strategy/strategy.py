@@ -30,7 +30,7 @@ import pickle
 from datetime import datetime, timedelta
 
 from db import schema as db_schema
-from .signals import detect_retest_with_gap, detect_bb_expand
+from .signals import detect_retest_with_gap, detect_bb_expand, detect_squeeze_breakout
 
 # ===================== 日志配置 =====================
 logger = logging.getLogger("strategy")
@@ -67,20 +67,22 @@ WEEKLY_RETEST_WINDOW = 50
 WEEKLY_RETEST_MIN_GAP = 5
 WEEKLY_RETEST_MIN_TOUCHES = 2
 
-# -- 布林带 --
+# -- 布林带：趋势延续（Trend Continuation） --
 BB_PERIOD = 20
 BB_STD_MULT = 2
-BB_SHORT_MA = 5                # 短期带宽MA（检测扩张加速）
-BB_LONG_MA = 20                # 长期带宽MA（基线）
+BB_SHORT_MA = 5                # 带宽短期MA（检测扩张加速）
+BB_LONG_MA = 20                # 带宽长期MA（基线）
 BB_SHORT_DIR_PERIOD = 2        # 连续扩张期数
 BB_MID_DIR_PERIOD = 3          # 中轨方向判定周期
 MONTHLY_BB_REQUIRE_MID_UP = False   # 月布林不要求中轨向上
 WEEKLY_BB_REQUIRE_MID_UP = True     # 周布林要求中轨走平向上
-WEEKLY_BB_OVERBOUGHT = None
-WEEKLY_BB_PRE_EXPAND = True         # 收缩预警模式
-WEEKLY_BB_CONTRACTION_RATIO = 0.9   # 收缩阈值
-WEEKLY_BB_USE_DUAL_MODE = True      # 双模式：标准扩张+收缩预警
-WEEKLY_BB_PRICE_LIMIT = None
+
+# -- 布林带：挤压爆发（Squeeze Breakout，v4.6 新增） --
+BB_SQ_ENABLED = True
+BB_SQ_REQUIRE_MID_UP = False        # 不等均线拐头，爆发即确认
+BB_SQ_CONTRACTION_PCT = 10          # 带宽历史分位阈值（%）
+BB_SQ_CONTRACTION_LOOKBACK = 50     # 回溯 K 线根数
+BB_SQ_EXPANSION_CONFIRM = 2         # 带宽连续回升确认期数
 
 MA_DIR_PERIOD = 3              # 均线方向判定周期
 
@@ -165,15 +167,24 @@ def _load_config():
             if k in wr: globals()[g] = wr[k]
 
         bb = stg.get('bollinger', {})
-        for k, g in [('period', 'BB_PERIOD'), ('std_mult', 'BB_STD_MULT'),
-                     ('short_ma', 'BB_SHORT_MA'), ('long_ma', 'BB_LONG_MA'),
-                     ('short_dir_period', 'BB_SHORT_DIR_PERIOD'), ('mid_dir_period', 'BB_MID_DIR_PERIOD'),
-                     ('monthly_require_mid_up', 'MONTHLY_BB_REQUIRE_MID_UP'),
-                     ('weekly_require_mid_up', 'WEEKLY_BB_REQUIRE_MID_UP'),
-                     ('weekly_pre_expand', 'WEEKLY_BB_PRE_EXPAND'),
-                     ('weekly_contraction_ratio', 'WEEKLY_BB_CONTRACTION_RATIO'),
-                     ('weekly_dual_mode', 'WEEKLY_BB_USE_DUAL_MODE')]:
+        for k, g in [('period', 'BB_PERIOD'), ('std_mult', 'BB_STD_MULT')]:
             if k in bb: globals()[g] = bb[k]
+
+        tc = bb.get('trend_continuation', {})
+        for k, g in [('short_ma', 'BB_SHORT_MA'), ('long_ma', 'BB_LONG_MA'),
+                     ('consecutive_periods', 'BB_SHORT_DIR_PERIOD'),
+                     ('mid_dir_period', 'BB_MID_DIR_PERIOD'),
+                     ('require_mid_up', 'WEEKLY_BB_REQUIRE_MID_UP'),
+                     ('monthly_require_mid_up', 'MONTHLY_BB_REQUIRE_MID_UP')]:
+            if k in tc: globals()[g] = tc[k]
+
+        sq = bb.get('squeeze_breakout', {})
+        for k, g in [('enabled', 'BB_SQ_ENABLED'),
+                     ('require_mid_up', 'BB_SQ_REQUIRE_MID_UP'),
+                     ('contraction_percentile', 'BB_SQ_CONTRACTION_PCT'),
+                     ('contraction_lookback', 'BB_SQ_CONTRACTION_LOOKBACK'),
+                     ('expansion_confirm', 'BB_SQ_EXPANSION_CONFIRM')]:
+            if k in sq: globals()[g] = sq[k]
 
         fin = stg.get('financial_filter', {})
         for k, g in [('enabled', 'USE_FINANCIAL_FILTER'), ('consec_quarters', 'FIN_CONSEC'),
@@ -408,13 +419,14 @@ def check_annual_trend_fast(code, cache_entry, yearly, target_date):
 
 def compute_trend_strength(code, df_daily, target_date):
     """
-    计算趋势强度评分（0-100），用于同信号类型内的排序。
+    计算趋势强度评分（0-110），用于同信号类型内的排序。
     只依赖 target_date 之前的数据，无未来函数。
 
-    三个维度：
+    四个维度：
       1. 年线乖离率 (0-40分)：最优区间3%~20%，站上过远扣分
       2. 均线多头排列 (0-40分)：MA20>MA60>MA120>MA250 逐级给分
       3. 近20日涨幅 (0-20分)：正值加分，负值零分
+      4. Squeeze预警   (0-10分)：带宽越接近历史低分位，弹性势能越大
     """
     try:
         df = df_daily.loc[code].sort_index()
@@ -465,7 +477,17 @@ def compute_trend_strength(code, df_daily, target_date):
         if ret_20d > 0:
             ret_score = min(20, ret_20d * 1.33)  # 0~15%涨幅映射到0~20分
 
-    return round(dev_score + align_score + ret_score, 1)
+    # 4. Squeeze 预警 (0-10分)：日线带宽处于历史低分位说明周线可能在 squeeze 中
+    sq_score = 0.0
+    if len(close) >= 250:
+        roll_mid = close.rolling(20).mean()
+        roll_std = close.rolling(20).std()
+        bw_daily = (roll_mid + 2 * roll_std - (roll_mid - 2 * roll_std)) / roll_mid
+        bw_pct = bw_daily.rolling(250, min_periods=100).rank(pct=True).iloc[-1]
+        if not pd.isna(bw_pct) and bw_pct <= 0.30:
+            sq_score = round((0.30 - bw_pct) / 0.30 * 10, 1)
+
+    return round(dev_score + align_score + ret_score + sq_score, 1)
 
 
 # ===================== 预计算 =====================
@@ -488,8 +510,9 @@ def _get_cache_key():
             'bb_short': BB_SHORT_MA, 'bb_long': BB_LONG_MA,
             'bb_short_dir': BB_SHORT_DIR_PERIOD, 'bb_mid_dir': BB_MID_DIR_PERIOD,
             'mb_mid_up': MONTHLY_BB_REQUIRE_MID_UP, 'wb_mid_up': WEEKLY_BB_REQUIRE_MID_UP,
-            'wb_pre_expand': WEEKLY_BB_PRE_EXPAND, 'wb_contraction': WEEKLY_BB_CONTRACTION_RATIO,
-            'wb_dual': WEEKLY_BB_USE_DUAL_MODE,
+            'sq_enabled': BB_SQ_ENABLED, 'sq_mid_up': BB_SQ_REQUIRE_MID_UP,
+            'sq_pct': BB_SQ_CONTRACTION_PCT, 'sq_lookback': BB_SQ_CONTRACTION_LOOKBACK,
+            'sq_confirm': BB_SQ_EXPANSION_CONFIRM,
         }
         param_str = json.dumps(params, sort_keys=True)
         param_hash = hashlib.md5(param_str.encode()).hexdigest()
@@ -613,7 +636,7 @@ def precompute_all_signals_once(df_daily):
             df_w = df_code[['close', 'low']].resample('W').agg({'close': 'last', 'low': 'min'}).dropna()
             df_m = df_code[['close', 'low']].resample('M').agg({'close': 'last', 'low': 'min'}).dropna()
 
-            w_retest = m_retest = w_bb = m_bb = None
+            w_retest = m_retest = w_bb = w_bb_sq = m_bb = None
             if len(df_w) >= 20 and len(df_m) >= 18:
                 w_retest = detect_retest_with_gap(
                     df_w, 20, WEEKLY_RETEST_DOWN, WEEKLY_RETEST_NEAR,
@@ -628,15 +651,20 @@ def precompute_all_signals_once(df_daily):
                     require_mid_up=WEEKLY_BB_REQUIRE_MID_UP,
                     short_dir_period=BB_SHORT_DIR_PERIOD,
                     overbought_limit=None,
-                    pre_expand=WEEKLY_BB_PRE_EXPAND,
-                    contraction_ratio=WEEKLY_BB_CONTRACTION_RATIO,
-                    use_dual_mode=WEEKLY_BB_USE_DUAL_MODE,
-                    price_limit=WEEKLY_BB_PRICE_LIMIT)
+                    pre_expand=False,
+                    use_dual_mode=False)
                 m_bb = detect_bb_expand(
                     df_m, BB_PERIOD, BB_STD_MULT, BB_SHORT_MA, BB_LONG_MA,
                     require_mid_up=MONTHLY_BB_REQUIRE_MID_UP,
                     short_dir_period=BB_SHORT_DIR_PERIOD,
-                    overbought_limit=None)
+                    overbought_limit=None,
+                    pre_expand=False,
+                    use_dual_mode=False)
+                if BB_SQ_ENABLED:
+                    w_bb_sq = detect_squeeze_breakout(
+                        df_w, BB_PERIOD, BB_STD_MULT,
+                        BB_SQ_CONTRACTION_PCT, BB_SQ_CONTRACTION_LOOKBACK,
+                        BB_SQ_EXPANSION_CONFIRM, BB_SQ_REQUIRE_MID_UP)
 
             signal_cache[code] = {
                 'rolling_ok': rolling_ok,
@@ -646,6 +674,7 @@ def precompute_all_signals_once(df_daily):
                 'w_retest': w_retest,
                 'm_retest': m_retest,
                 'w_bb': w_bb,
+                'w_bb_sq': w_bb_sq,
                 'm_bb': m_bb,
             }
         except Exception as e:

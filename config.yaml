@@ -1,72 +1,110 @@
+# ============================================================
+# A股量化选股系统 v4.6 — 全局配置
+# 修改策略参数只需编辑此文件，重启即生效
+# ============================================================
+
+# --- 数据库 ---
 database:
-  path: stocks_2y.db
-  backup_before_update: true
-  max_backups: 5
+  path: stocks_2y.db             # SQLite数据文件
+  backup_before_update: true     # 更新前自动备份
+  max_backups: 5                 # 保留最近N份备份
+
+# --- 选股策略 ---
 strategy:
-  benchmark: sh.000300
+  benchmark: sh.000300           # 回测对标指数
+
+  # 流动性门槛（日成交额，万元）
   liquidity:
-    min_20d_amount: 5000
-    min_120d_amount: 3000
+    min_20d_amount: 5000         # 20日均成交额 ≥ 5000万
+    min_120d_amount: 3000        # 120日均成交额 ≥ 3000万
+
+  # 年线趋势：滚动12个月涨幅+量增+站上年线+斜率
   annual_trend:
-    rolling_days: 250
-    rolling_price_up: 0.15
-    rolling_vol_up: 0.3
-    ma_slope_threshold: 0
+    rolling_days: 250            # 滚动窗口（≈12个月）
+    rolling_price_up: 0.15       # 滚动涨幅 ≥ 15%
+    rolling_vol_up: 0.3          # 滚动日均成交额增幅 ≥ 30%
+    ma_slope_threshold: 0        # 年线斜率 ≥ 0（走平或向上）
+
+  # 月线回踩：二次回踩确认（v4.6: min_touches 1→2）
   monthly_retest:
-    down_tolerance: 0.12
-    near_tolerance: 0.08
-    window: 18
-    min_gap: 3
-    min_touches: 1
+    down_tolerance: 0.12         # 下探 MA 幅度 ≤ 12%
+    near_tolerance: 0.08         # 靠近 MA 幅度 ≤ 8%
+    window: 18                   # 观察窗口（根月K线）
+    min_gap: 3                   # 两次回踩最小间隔（根）
+    min_touches: 2               # ★ 二次回踩确认，提升信号质量
+
+  # 周线回踩：二次回踩确认
   weekly_retest:
     down_tolerance: 0.12
     near_tolerance: 0.08
-    window: 60
-    min_gap: 5
-    min_touches: 2
+    window: 60                   # 观察窗口（根周K线）
+    min_gap: 5                   # 两次回踩最小间隔（根）
+    min_touches: 2               # ★ 二次回踩确认
+
+  # 布林带信号 v4.6: 拆为两个独立模式，各自自洽
   bollinger:
-    period: 20
-    std_mult: 2
-    short_ma: 5
-    long_ma: 20
-    short_dir_period: 2
-    mid_dir_period: 3
-    monthly_require_mid_up: false
-    weekly_require_mid_up: true
-    weekly_pre_expand: true
-    weekly_contraction_ratio: 0.9
-    weekly_dual_mode: true
+    period: 20                   # 布林带均线周期
+    std_mult: 2                  # 标准差倍数
+
+    # 模式 A：趋势延续（Trend Continuation）
+    # 确认已有趋势还在加速，用于趋势中途加仓
+    trend_continuation:
+      enabled: true
+      require_mid_up: true         # 周线要求中轨向上（做的是趋势确认，不是预判）
+      short_ma: 5                  # 带宽短期均线
+      long_ma: 20                  # 带宽长期均线（基线）
+      consecutive_periods: 2       # 带宽连续扩张确认期数
+      mid_dir_period: 3            # 中轨方向判定周期
+      monthly_require_mid_up: false  # 月线不要求中轨向上（周期长容忍度大）
+
+    # 模式 B：挤压爆发（Squeeze Breakout）
+    # 捕捉新一轮主升浪启动点，不等均线确认
+    # John Bollinger: "The Squeeze is the single most important BB signal"
+    squeeze_breakout:
+      enabled: true                # 仅周线启用（月线 squeeze 滞后太大）
+      require_mid_up: false        # ★ 不等均线拐头，爆发本身就是最强确认
+      contraction_percentile: 10   # 带宽处于历史 N% 分位以下 = squeeze 态
+      contraction_lookback: 50     # 回溯 N 根 K 线计算分位
+      expansion_confirm: 2         # 带宽连续回升 N 期确认爆发
+
+  # 财务筛选：连续季度盈利+增长
   financial_filter:
-    enabled: true
-    consec_quarters: 2
-    min_profit_yoy: 0.0
-    min_pni_yoy: 0.0
-    min_net_profit: 10000000
-    profit_acceleration: true
-  # v4.5 归因驱动权重（基于 signal_attribution.csv 历史累积收益）
+    enabled: true                # 设为 false 关闭（纯技术面选股）
+    consec_quarters: 2           # 连续检查季度数
+    min_profit_yoy: 0.0          # 归母净利润同比 > 0%
+    min_pni_yoy: 0.0             # 扣非净利润同比 > 0%
+    min_net_profit: 10000000     # 单季度净利润 ≥ 1000万
+    profit_acceleration: true    # ★ 盈利加速度：最新季度增速 ≥ 前一季度
+
+  # ★ 信号权重（仅用于选股排序，回测用等权买入）
+  # v4.5: 归因驱动权重 — 基于 signal_attribution.csv 历史累积收益重排
   # 缩写：mr=月回踩 mb=月布林 wr=周回踩 wb=周布林
   signal_ranking:
-    all_resonance: 20         # Tier1 主力 758次/+1218%
-    mr_mb: 12                 # 最稳定弹性 283次/+197%
-    mb_wr: 10                 # 最高单笔收益 3.67%均收
-    mr_mb_wr: 8               # 三信号共振
-    mb_wr_wb: 6               # 56%胜率 32次/+88%
-    mr_mb_wr_wb: 4            # 四信号但归因样本极少
-    mr_wr: 3                  # 边际+30%
-    wr_wb: 2                  # 边际+40%
-    mr_wr_wb: 0               # 禁用：-125%累积亏损
-    mr_mb_wb: 0               # 禁用：3次样本太少
-    mr_wb: 0                  # 禁用：3次样本太少
+    all_resonance: 20             # Tier1 绝对主力 758次 / +1218%
+    mr_mb: 12                     # 最稳定弹性组合 283次 / +197%
+    mb_wr: 10                     # 最高单笔均收 3.67%
+    mr_mb_wr: 8                   # 三信号共振
+    mb_wr_wb: 6                   # 56%胜率 32次 / +88%
+    mr_mb_wr_wb: 4                # 四信号全但归因样本极少
+    mr_wr: 3                      # 边际 +30%
+    wr_wb: 2                      # 边际 +40%
+    mr_wr_wb: 0                   # 禁用：-125% 累积亏损
+    mr_mb_wb: 0                   # 禁用：3次样本太少
+    mr_wb: 0                      # 禁用：3次样本太少
+
+# --- 回测参数 ---
 backtest:
-  init_cash: 1000000
-  max_stocks: 200
-  lookback_years: 2
-  rebalance_freq: W              # 周频调仓（v4.5从月频改为周频）
-  commission: 0.0001
-  slippage: 0.001
-  stamp_duty: 0.001
-  stop_loss_enabled: true
-  stop_loss_pct: -10.0            # 止损线
+  init_cash: 1000000             # 初始资金
+  max_stocks: 200                # 单期最大持仓数
+  lookback_years: 2              # 回溯年数
+  rebalance_freq: W              # 调仓频率：M=月线 W=周线（v4.5 改为周频）
+  commission: 0.0001             # 佣金（万1）
+  slippage: 0.001                # 滑点（千1）
+  stamp_duty: 0.001              # 卖出印花税（千1）
+  stop_loss_enabled: true        # ★ 个股止损开关
+  stop_loss_pct: -10.0           # ★ 止损线（%）
+
+# --- 预计算缓存 ---
 cache:
-  enabled: true
-  file: .signal_cache.pkl
+  enabled: true                  # 启用缓存（参数不变时跳过重算）
+  file: .signal_cache.pkl        # 缓存文件路径

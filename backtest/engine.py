@@ -86,17 +86,23 @@ def select_stocks_at_date(signal_cache, yearly, df_daily, df_fin, basic_df,
     if not base_codes:
         return [], [], []
 
-    # 3. 四信号提取（从预计算缓存切片，无重算）
-    m_retest_codes, m_bb_codes, w_retest_codes, w_bb_codes = [], [], [], []
+    # 3. 五信号提取（从预计算缓存切片，无重算）
+    #    周布林 = 趋势延续 OR 挤压爆发，内部两个独立检测，标签统一
+    m_retest_codes, m_bb_codes, w_retest_codes = [], [], []
+    w_bb_tc_codes, w_bb_sq_codes = [], []
     for code in base_codes:
         entry = signal_cache[code]
         if st.get_latest_value(entry['m_retest'], target_ts): m_retest_codes.append(code)
         if st.get_latest_value(entry['m_bb'], target_ts):     m_bb_codes.append(code)
         if st.get_latest_value(entry['w_retest'], target_ts): w_retest_codes.append(code)
-        if st.get_latest_value(entry['w_bb'], target_ts):     w_bb_codes.append(code)
+        if st.get_latest_value(entry['w_bb'], target_ts):     w_bb_tc_codes.append(code)
+        if st.get_latest_value(entry.get('w_bb_sq'), target_ts): w_bb_sq_codes.append(code)
+
+    w_bb_codes = list(set(w_bb_tc_codes) | set(w_bb_sq_codes))  # 合并为统一"周布林"标签
 
     logger.info("月线回踩: %s 只，月线布林: %s 只", len(m_retest_codes), len(m_bb_codes))
-    logger.info("周线回踩: %s 只，周线布林: %s 只", len(w_retest_codes), len(w_bb_codes))
+    logger.info("周线回踩: %s 只，周线布林: %s 只 (趋势延续=%s, 挤压爆发=%s)",
+                len(w_bb_codes), len(w_bb_tc_codes), len(w_bb_sq_codes))
 
     # 4. 财务筛选
     fin_codes = st.apply_financial_filter(base_codes, df_fin, target_ts)
